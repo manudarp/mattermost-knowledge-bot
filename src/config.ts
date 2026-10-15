@@ -63,7 +63,7 @@ const ConfigSchema = z.object({
   LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(300_000),
   // Ceiling for the automatic max_tokens escalation when a reply is cut off
   // (reasoning models spend part of the budget "thinking").
-  LLM_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(32_000),
+  LLM_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(16_000),
   // OpenRouter only: reasoning effort for thinking models (sent as `reasoning.effort`).
   LLM_REASONING_EFFORT: z.enum(["", "low", "medium", "high"]).default(""),
   // Append Qwen's `/no_think` switch to prompts. Harmless elsewhere, but can be disabled.

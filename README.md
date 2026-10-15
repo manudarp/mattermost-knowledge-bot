@@ -88,7 +88,7 @@ Collections can be linked and unlinked at runtime from Mattermost — see [Manag
 | `LLM_EXTRA_HEADERS` | no | — | Extra headers as JSON, e.g. `{"HTTP-Referer":"https://wiki.example.com","X-Title":"KB Bot"}` |
 | `LLM_MAX_CONCURRENCY` | no | `1` | Parallel LLM calls. Keep `1` for single-slot llama.cpp, raise (e.g. `4`) for hosted providers |
 | `LLM_TIMEOUT_MS` | no | `300000` | Per-request timeout |
-| `LLM_MAX_OUTPUT_TOKENS` | no | `32000` | When a reply comes back empty or cut off (typical of reasoning models that spend the budget thinking), the bot retries with a doubled token budget up to this cap |
+| `LLM_MAX_OUTPUT_TOKENS` | no | `16000` | When a reply comes back empty or cut off (typical of reasoning models that spend the budget thinking), the bot retries with a doubled token budget up to this cap |
 | `LLM_REASONING_EFFORT` | no | — | OpenRouter only: `low`/`medium`/`high` reasoning effort for thinking models; `low` makes saves faster and avoids empty replies |
 | `LLM_NO_THINK_HINT` | no | `true` | Append Qwen's `/no_think` switch to prompts |
 | `ANTHROPIC_API_KEY` | no | — | Anthropic API key (used only when `LLM_BASE_URL` is not set) |

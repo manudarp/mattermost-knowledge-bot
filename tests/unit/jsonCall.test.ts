@@ -45,8 +45,8 @@ describe("callModelJson", () => {
 
   it("budget escalation is capped by LLM_MAX_OUTPUT_TOKENS", async () => {
     script.push({ text: "" }, { text: "" }, { text: "" });
-    await expect(callModelJson({ ...base, maxTokens: 20000 })).rejects.toThrow(/risposta vuota/);
-    expect(calls.map((c) => c.maxTokens)).toEqual([20000, 32000, 32000]);
+    await expect(callModelJson({ ...base, maxTokens: 12000 })).rejects.toThrow(/risposta vuota/);
+    expect(calls.map((c) => c.maxTokens)).toEqual([12000, 16000, 16000]);
   });
 
   it("invalid JSON → retries with the error and the previous answer", async () => {
