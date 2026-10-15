@@ -29,15 +29,27 @@ export function runMigrations(): void {
     .filter((f) => f.endsWith(".sql"))
     .sort();
 
-  for (const file of files) {
-    if (applied.has(file)) continue;
-    const sql = readFileSync(join(migrationsDir, file), "utf8");
-    const tx = db.transaction(() => {
-      db.exec(sql);
-      db.prepare("INSERT INTO schema_migrations (name) VALUES (?)").run(file);
-    });
-    tx();
-    logger.info({ migration: file }, "applied migration");
+  const pendingFiles = files.filter((f) => !applied.has(f));
+  if (pendingFiles.length === 0) return;
+
+  // Table rebuilds (CREATE new / copy / DROP old / RENAME) would fire ON DELETE
+  // CASCADE on referencing tables. foreign_keys can't be toggled inside a
+  // transaction, so switch it off around the whole batch and verify afterwards.
+  db.pragma("foreign_keys = OFF");
+  try {
+    for (const file of pendingFiles) {
+      const sql = readFileSync(join(migrationsDir, file), "utf8");
+      const tx = db.transaction(() => {
+        db.exec(sql);
+        db.prepare("INSERT INTO schema_migrations (name) VALUES (?)").run(file);
+      });
+      tx();
+      logger.info({ migration: file }, "applied migration");
+    }
+    const violations = db.pragma("foreign_key_check") as unknown[];
+    if (violations.length > 0) logger.warn({ violations }, "foreign_key_check_failed_after_migrations");
+  } finally {
+    db.pragma("foreign_keys = ON");
   }
 }
 
