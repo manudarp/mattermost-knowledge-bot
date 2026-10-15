@@ -9,6 +9,12 @@ const llmSemaphore = new Semaphore(config.LLM_MAX_CONCURRENCY);
 
 export interface CallModelResult {
   text: string;
+  /** Provider's stop reason ("stop", "length", "max_tokens"…), when reported. */
+  finishReason: string | null;
+  /** Generation stopped because it hit the output-token limit. */
+  truncated: boolean;
+  /** The model produced a reasoning/thinking trace (which also consumes output tokens). */
+  reasoned: boolean;
   usage: { input: number; output: number };
 }
 
@@ -54,6 +60,15 @@ export function noThinkHint(): string {
   return config.LLM_NO_THINK_HINT ? "/no_think" : "";
 }
 
+type MessageContent = string | null | Array<{ type?: string; text?: string }>;
+
+/** Some providers return content as an array of parts instead of a string. */
+function contentToText(content: MessageContent | undefined): string {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+  return content.map((p) => (typeof p?.text === "string" ? p.text : "")).join("");
+}
+
 async function callOpenAICompatible(opts: CallModelOpts): Promise<CallModelResult> {
   const body = {
     model: config.LLM_MODEL,
@@ -63,6 +78,9 @@ async function callOpenAICompatible(opts: CallModelOpts): Promise<CallModelResul
     ],
     max_tokens: opts.maxTokens,
     temperature: opts.temperature,
+    // OpenRouter's unified reasoning control; only sent when configured because
+    // other OpenAI-compatible servers may reject unknown parameters.
+    ...(config.LLM_REASONING_EFFORT ? { reasoning: { effort: config.LLM_REASONING_EFFORT } } : {}),
   };
 
   const headers: Record<string, string> = {
@@ -91,7 +109,10 @@ async function callOpenAICompatible(opts: CallModelOpts): Promise<CallModelResul
       }
 
       return (await res.json()) as {
-        choices?: Array<{ message?: { content?: string | null } }>;
+        choices?: Array<{
+          message?: { content?: MessageContent; reasoning?: string | null; reasoning_content?: string | null };
+          finish_reason?: string | null;
+        }>;
         usage?: { prompt_tokens: number; completion_tokens: number };
         error?: { message?: string };
       };
@@ -108,10 +129,18 @@ async function callOpenAICompatible(opts: CallModelOpts): Promise<CallModelResul
   // OpenRouter can return HTTP 200 with an `error` object (upstream failure).
   if (data.error) throw new Error(`LLM provider error: ${data.error.message ?? "unknown"}`);
 
-  const rawText = data.choices?.[0]?.message?.content ?? "";
+  const choice = data.choices?.[0];
+  const rawText = contentToText(choice?.message?.content);
   const text = stripThinkTags(rawText);
+  const finishReason = choice?.finish_reason ?? null;
+  const reasoned = Boolean(
+    choice?.message?.reasoning || choice?.message?.reasoning_content || rawText.trimStart().startsWith("<think>"),
+  );
   return {
     text,
+    finishReason,
+    truncated: finishReason === "length" || finishReason === "max_tokens",
+    reasoned,
     usage: {
       input: data.usage?.prompt_tokens ?? 0,
       output: data.usage?.completion_tokens ?? 0,
@@ -138,6 +167,9 @@ async function callAnthropic(opts: CallModelOpts): Promise<CallModelResult> {
 
   return {
     text: textBlock.text,
+    finishReason: response.stop_reason ?? null,
+    truncated: response.stop_reason === "max_tokens",
+    reasoned: false,
     usage: {
       input: response.usage.input_tokens,
       output: response.usage.output_tokens,

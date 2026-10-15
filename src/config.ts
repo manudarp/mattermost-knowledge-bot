@@ -61,6 +61,11 @@ const ConfigSchema = z.object({
   // Parallel LLM calls. Keep 1 for single-slot llama.cpp; raise for remote providers.
   LLM_MAX_CONCURRENCY: z.coerce.number().int().positive().default(1),
   LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(300_000),
+  // Ceiling for the automatic max_tokens escalation when a reply is cut off
+  // (reasoning models spend part of the budget "thinking").
+  LLM_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(32_000),
+  // OpenRouter only: reasoning effort for thinking models (sent as `reasoning.effort`).
+  LLM_REASONING_EFFORT: z.enum(["", "low", "medium", "high"]).default(""),
   // Append Qwen's `/no_think` switch to prompts. Harmless elsewhere, but can be disabled.
   LLM_NO_THINK_HINT: boolFlag(true),
 
