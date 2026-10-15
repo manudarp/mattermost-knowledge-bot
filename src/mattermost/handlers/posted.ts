@@ -3,26 +3,25 @@ import type { MattermostClient, Post } from "../client.js";
 import type { OutlineClient } from "../../outline/client.js";
 import type { Config } from "../../config.js";
 import type { Logger } from "../../logger.js";
-import { parseMention, sortThreadPosts, extractFirstHashtag } from "../helpers.js";
-import { findChannelByMmId } from "../../db/repositories/channels.js";
-import { listTopicsByChannel, findTopicByChannelAndSlug } from "../../db/repositories/topics.js";
-import {
-  findActivePendingByThreadRoot,
-  deletePendingById,
-} from "../../db/repositories/pendingConfirmations.js";
+import { parseMention } from "../helpers.js";
 import { db } from "../../db/index.js";
-import { executeSave, buildSavedMessage } from "../../core/saveFlow.js";
 import { withChannelLock } from "../../utils/locks.js";
-import { parseCommand } from "../../core/commandParser.js";
-import { detectTopic, toDisplayName } from "../../ai/topicDetection.js";
-import {
-  requestConfirmation,
-  resumeFromConfirmation,
-} from "../../core/confirmationFlow.js";
+import { parseCommand, parseProposalReply } from "../../core/commandParser.js";
 import { formatUserError } from "../../utils/errorMessage.js";
-import { search } from "../../search/retrieval.js";
-import { generateAnswer } from "../../search/answerGeneration.js";
-import { llmQueueDepth } from "../../ai/client.js";
+import { ensureChannelRegistered } from "../../core/channelRegistry.js";
+import { handleCollectionsCommand, collectionsHelp } from "../../core/collectionCommands.js";
+import { getEffectiveCollections } from "../../core/collectionScope.js";
+import { answerQuestion } from "../../core/questionFlow.js";
+import {
+  startSaveProposal,
+  applyProposal,
+  cancelProposal,
+  reviseProposal,
+  canDecide,
+  type SmartSaveCtx,
+} from "../../core/smartSave.js";
+import { findActiveProposalByThread, countPendingProposals } from "../../db/repositories/saveProposals.js";
+import { llmDescription } from "../../ai/client.js";
 
 interface PostedCtx {
   client: MattermostClient;
@@ -35,54 +34,103 @@ interface PostedCtx {
 
 type PostedEvent = Extract<WsEvent, { event: "posted" }>;
 
-const checkExistingSaveStmt = db.prepare("SELECT id FROM saves WHERE mm_post_id = ?");
 const lastSuccessfulSaveStmt = db.prepare(
-  `SELECT s.created_at AS created_at, s.triggered_by_username AS username, t.topic_display_name AS topic_display_name
-   FROM saves s LEFT JOIN topics t ON t.id = s.topic_id
-   WHERE s.mm_channel_id = ? AND s.status = 'success'
-   ORDER BY s.id DESC LIMIT 1`,
+  `SELECT created_at, triggered_by_username AS username,
+          json_extract(payload_json, '$.document_title') AS document_title,
+          json_extract(payload_json, '$.document_url') AS document_url
+   FROM saves WHERE mm_channel_id = ? AND status = 'success'
+   ORDER BY id DESC LIMIT 1`,
 );
 
-async function handleHashtagOverrideForPending(
-  post: Post,
-  ctx: PostedCtx,
-): Promise<boolean> {
-  const trimmed = post.message.trim();
-  if (!trimmed.startsWith("#")) return false;
+async function usernameOf(client: MattermostClient, userId: string): Promise<string> {
+  try {
+    const [u] = await client.getUsersByIds([userId]);
+    return u?.username ?? userId;
+  } catch {
+    return userId;
+  }
+}
 
-  const hashtag = extractFirstHashtag(trimmed);
-  if (!hashtag) return false;
+function isBotMentioned(post: Post, botUserId: string): boolean {
+  const rawMentions = post.props?.["mentions"];
+  if (rawMentions === undefined) return false;
+  let mentions: unknown = rawMentions;
+  if (typeof mentions === "string") {
+    try {
+      mentions = JSON.parse(mentions);
+    } catch {
+      return false;
+    }
+  }
+  return Array.isArray(mentions) && (mentions as unknown[]).includes(botUserId);
+}
 
-  const pending = findActivePendingByThreadRoot(post.root_id);
-  if (!pending) return false;
+/**
+ * A reply inside a thread with a pending proposal: approve / cancel / redirect.
+ * Returns true when the message was consumed.
+ */
+async function handleProposalReply(post: Post, text: string, ctx: PostedCtx, addressedToBot: boolean): Promise<boolean> {
+  const proposal = findActiveProposalByThread(post.root_id);
+  if (!proposal) return false;
+  const reply = parseProposalReply(text);
+  if (!reply) return false;
 
-  // Same-user guard: only the original requester may override their own pending confirmation.
-  if (pending.triggered_by_user_id !== post.user_id) {
-    ctx.logger.debug(
-      { pending_id: pending.id, replied_by: post.user_id, original: pending.triggered_by_user_id },
-      "hashtag_override_ignored_different_user",
-    );
-    return false;
+  const username = await usernameOf(ctx.client, post.user_id);
+  if (!canDecide(proposal, post.user_id, username)) {
+    // A plain "ok" between colleagues isn't necessarily meant for the bot.
+    if (!addressedToBot) return false;
+    await ctx.client.createPost({
+      channel_id: post.channel_id,
+      root_id: post.root_id,
+      message: `⛔ @${username}, solo chi ha richiesto il salvataggio (o un approvatore configurato) può decidere su questa proposta.`,
+    });
+    return true;
   }
 
-  ctx.logger.info(
-    { pending_id: pending.id, hashtag },
-    "confirmation_hashtag_override",
-  );
+  const saveCtx: SmartSaveCtx = {
+    mmClient: ctx.client,
+    outlineClient: ctx.outlineClient,
+    logger: ctx.logger,
+    botUserId: ctx.botUserId,
+  };
+  ctx.logger.info({ proposal_id: proposal.id, reply: reply.kind }, "proposal_reply_received");
 
   await withChannelLock(post.channel_id, async () => {
-    const existingTopic = findTopicByChannelAndSlug(post.channel_id, hashtag);
-    const displayName = existingTopic?.topic_display_name ?? toDisplayName(hashtag);
-
-    await resumeFromConfirmation({
-      pending,
-      newTopicSlugOverride: hashtag,
-      newTopicDisplayNameOverride: displayName,
-      ctx: { mmClient: ctx.client, outlineClient: ctx.outlineClient, logger: ctx.logger },
-    });
+    if (reply.kind === "approve") {
+      await applyProposal({ proposal, actorUserId: post.user_id, actorUsername: username, ctx: saveCtx });
+    } else if (reply.kind === "cancel") {
+      await cancelProposal({ proposal, actorUsername: username, ctx: saveCtx });
+      await ctx.client.createPost({ channel_id: post.channel_id, root_id: post.root_id, message: "👌 Proposta annullata, non ho modificato nulla." });
+    } else {
+      await reviseProposal({ proposal, change: reply, ctx: saveCtx });
+    }
   });
-
   return true;
+}
+
+function helpText(config: Config): string {
+  const bot = `@${config.MM_BOT_USERNAME}`;
+  return `**Knowledge Bot — comandi**
+
+**Domande**
+• \`${bot} <domanda>\` — risponde usando la knowledge base quando pertinente, altrimenti con conoscenze generali${config.GENERAL_QA_ENABLED ? "" : " _(risposte generiche disabilitate)_"}
+• \`${bot} cerca <domanda>\` — risponde **solo** dalla knowledge base, con le fonti
+• \`${bot} chiedi <domanda>\` — domanda generica all'AI, senza consultare la knowledge base
+_In un thread il bot tiene conto dei messaggi precedenti._
+
+**Salvare conoscenza** (in un thread)
+• \`${bot} salva\` — analizza il thread, trova collection e documento giusti e **propone** la modifica
+• \`${bot} salva <indicazioni>\` — es. \`salva aggiorna la fase 2 del progetto ACME\`
+Nessuna modifica viene applicata senza conferma: 👍/✅ o \`ok\` per applicare, 👎/❌ o \`annulla\` per scartare,
+\`doc: …\`, \`collezione: …\`, \`sotto: …\`, \`titolo: …\`, \`nota: …\` per correggere la proposta.
+
+${collectionsHelp()}
+
+**Altro**
+• \`${bot} status\` — collection collegate, proposte in attesa, ultimo salvataggio
+• \`${bot} help\` — questo messaggio
+
+Wiki: ${config.OUTLINE_URL}`;
 }
 
 export async function handlePosted(event: PostedEvent, ctx: PostedCtx): Promise<void> {
@@ -97,297 +145,145 @@ export async function handlePosted(event: PostedEvent, ctx: PostedCtx): Promise<
   }
 
   if (post.user_id === botUserId) return;
-
-  if (post.root_id) {
-    try {
-      const handled = await handleHashtagOverrideForPending(post, ctx);
-      if (handled) return;
-    } catch (err) {
-      logger.error({ err }, "hashtag_override_failed");
-      return;
-    }
-  }
+  // System messages (joins, header changes…) are never commands.
+  if (post.type && post.type.startsWith("system_")) return;
 
   const { mentioned, afterMention } = parseMention(post.message, config.BOT_TRIGGER_MENTIONS);
+  const mentionedViaProps = !mentioned && isBotMentioned(post, botUserId);
 
-  let mentionedViaProps = false;
-  if (!mentioned) {
-    const rawMentions = post.props["mentions"];
-    if (rawMentions !== undefined) {
-      let mentions: unknown = rawMentions;
-      if (typeof mentions === "string") {
-        try {
-          mentions = JSON.parse(mentions);
-        } catch {
-          mentions = [];
-        }
-      }
-      if (Array.isArray(mentions)) {
-        mentionedViaProps = (mentions as unknown[]).includes(botUserId);
+  // In a direct message with the bot every message is addressed to it.
+  const isDirect = event.data.channel_type === "D";
+  if (!mentioned && !mentionedViaProps && !isDirect) {
+    // Thread replies may still be decisions on a pending proposal ("ok", "doc: …").
+    if (post.root_id) {
+      try {
+        await handleProposalReply(post, post.message, ctx, false);
+      } catch (err) {
+        logger.error({ err }, "proposal_reply_failed");
       }
     }
+    return;
   }
 
-  if (!mentioned && !mentionedViaProps) return;
-
   const commandText = mentioned ? afterMention : post.message;
-
   logger.info(
     { post_id: post.id, channel_id: post.channel_id, root_id: post.root_id, user_id: post.user_id },
     "posted_bot_mentioned",
   );
 
-  const existingSave = checkExistingSaveStmt.get(post.id);
-  if (existingSave) {
-    logger.info({ post_id: post.id }, "posted_already_saved_skipping");
-    return;
+  if (post.root_id) {
+    try {
+      if (await handleProposalReply(post, commandText, ctx, true)) return;
+    } catch (err) {
+      logger.error({ err }, "proposal_reply_failed");
+      return;
+    }
   }
 
-  const channelRow = findChannelByMmId(post.channel_id);
-  if (!channelRow) {
-    await client.createPost({
-      channel_id: post.channel_id,
-      root_id: post.root_id || post.id,
-      message:
-        "⚠️ This channel isn't configured for the knowledge bot. Try removing me from the channel and re-adding me.",
-    });
+  const rootId = post.root_id || post.id;
+  const say = (message: string) => client.createPost({ channel_id: post.channel_id, root_id: rootId, message });
+
+  let channelRow;
+  try {
+    channelRow = (
+      await ensureChannelRegistered({ channelId: post.channel_id, mmClient: client, outlineClient, logger, botUserId })
+    ).row;
+  } catch (err) {
+    logger.error({ err, channel_id: post.channel_id }, "channel_registration_failed");
+    await say(`⚠️ Non riesco a configurare questo canale: ${formatUserError(err)}`);
     return;
   }
 
   const command = parseCommand(commandText);
+  const questionCtx = { mmClient: client, outlineClient, logger, botUserId };
 
-  if (command.subcommand === "search") {
-    const query = command.searchQuery;
-    if (!query) {
-      await client.createPost({
-        channel_id: post.channel_id,
-        root_id: post.root_id || post.id,
-        message: `Uso: \`@${config.MM_BOT_USERNAME} cerca domanda\` — cerca nella wiki aziendale.`,
-      });
+  switch (command.subcommand) {
+    case "unknown":
+      await say(
+        `Ciao! Fammi una domanda (\`@${config.MM_BOT_USERNAME} <domanda>\`), ` +
+          `oppure usa \`@${config.MM_BOT_USERNAME} salva\` in un thread per salvarlo nella wiki. ` +
+          `\`@${config.MM_BOT_USERNAME} help\` per tutti i comandi.`,
+      );
+      return;
+
+    case "help":
+      await say(helpText(config));
+      return;
+
+    case "search":
+    case "ask":
+    case "question": {
+      const query = command.searchQuery ?? "";
+      if (!query) {
+        const kw = command.subcommand === "search" ? "cerca" : "chiedi";
+        await say(`Uso: \`@${config.MM_BOT_USERNAME} ${kw} <domanda>\``);
+        return;
+      }
+      const mode = command.subcommand === "search" ? "kb" : command.subcommand === "ask" ? "general" : "auto";
+      if (mode === "general" && !config.GENERAL_QA_ENABLED) {
+        await say("ℹ️ Le domande generiche sono disabilitate su questo bot: uso solo la knowledge base.");
+        await answerQuestion({ post, query, mode: "kb", ctx: questionCtx });
+        return;
+      }
+      await answerQuestion({ post, query, mode, ctx: questionCtx });
       return;
     }
 
-    const { pending } = llmQueueDepth();
-    const thinkingPost = await client.createPost({
-      channel_id: post.channel_id,
-      root_id: post.root_id || post.id,
-      message: pending > 0
-        ? `⏳ In coda (${pending} richieste prima)… _${query}_`
-        : `🔍 Cerco nella wiki: _${query}_…`,
-    });
-
-    try {
-      const chunks = await search(query, 5, { channelId: post.channel_id });
-      const topChunk = chunks[0];
-      if (chunks.length === 0 || !topChunk || topChunk.score < 0.3) {
-        await client.updatePost(thinkingPost.id, `❌ Nessun documento rilevante trovato per: _${query}_`);
-        return;
+    case "collections": {
+      try {
+        const username = await usernameOf(client, post.user_id);
+        const message = await withChannelLock(post.channel_id, () =>
+          handleCollectionsCommand({
+            args: command.args,
+            channelId: post.channel_id,
+            userId: post.user_id,
+            username,
+            ctx: { mmClient: client, outlineClient, logger },
+          }),
+        );
+        await say(message);
+      } catch (err) {
+        logger.error({ err }, "collections_command_failed");
+        await say(`⚠️ Errore: ${formatUserError(err)}`);
       }
-
-      const { answer, sources } = await generateAnswer(query, chunks);
-
-      const seen = new Set<string>();
-      const uniqueSources = sources.filter((s) => {
-        const key = s.url;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
-      const sourceLines = uniqueSources
-        .map((s, i) => `[${i + 1}] [${s.title}${s.heading !== s.title ? ` › ${s.heading}` : ""}](${s.url})`)
-        .join("\n");
-
-      const reply = `${answer}\n\n**Fonti:**\n${sourceLines}`;
-      await client.updatePost(thinkingPost.id, reply);
-
-      logger.info({ query, chunks: chunks.length, topScore: topChunk.score }, "search_answered");
-    } catch (err) {
-      logger.error({ err, query }, "search_failed");
-      await client.updatePost(thinkingPost.id, `⚠️ Errore durante la ricerca: ${formatUserError(err)}`);
+      return;
     }
-    return;
-  }
 
-  if (command.subcommand === "help") {
-    await client.createPost({
-      channel_id: post.channel_id,
-      root_id: post.root_id || post.id,
-      message: `**Knowledge Bot commands:**
-• \`@${config.MM_BOT_USERNAME} salva\` (in a thread reply) — salva il thread, rileva topic automaticamente
-• \`@${config.MM_BOT_USERNAME} salva #topic-name\` — salva su un topic esplicito
-• \`@${config.MM_BOT_USERNAME} cerca domanda\` — cerca nella wiki aziendale con AI
-• \`@${config.MM_BOT_USERNAME} status\` — mostra le statistiche del canale
-• \`@${config.MM_BOT_USERNAME} help\` — mostra questo messaggio
-
-Documenti: ${config.OUTLINE_URL}`,
-    });
-    return;
-  }
-
-  if (command.subcommand === "status") {
-    const collectionUrl = `${config.OUTLINE_URL}/collection/${channelRow.outline_collection_id}`;
-    const topicsCount = listTopicsByChannel(post.channel_id).length;
-    const lastSave = lastSuccessfulSaveStmt.get(post.channel_id) as
-      | { created_at: string; username: string; topic_display_name: string | null }
-      | undefined;
-    const lastLine = lastSave
-      ? `Last save: ${lastSave.created_at} by @${lastSave.username} → ${lastSave.topic_display_name ?? "(deleted topic)"}`
-      : "Last save: none yet";
-
-    await client.createPost({
-      channel_id: post.channel_id,
-      root_id: post.root_id || post.id,
-      message: `📚 **${channelRow.mm_channel_name}** wiki status
-Collection: [${channelRow.mm_channel_name}](${collectionUrl})
-Topics: ${topicsCount}
-${lastLine}`,
-    });
-    return;
-  }
-
-  // Mentioned without a recognized command (free text or bare mention).
-  // Save now requires an explicit `salva`, so reply with a usage hint instead
-  // of saving the thread by accident.
-  if (command.subcommand === "unknown") {
-    await client.createPost({
-      channel_id: post.channel_id,
-      root_id: post.root_id || post.id,
-      message: `Specifica un comando:
-• \`@${config.MM_BOT_USERNAME} salva\` — salva questo thread nella wiki
-• \`@${config.MM_BOT_USERNAME} cerca domanda\` — cerca nella wiki aziendale
-• \`@${config.MM_BOT_USERNAME} help\` — tutti i comandi`,
-    });
-    return;
-  }
-
-  // subcommand === "save" — requires being a thread reply
-  if (!post.root_id) {
-    await client.createPost({
-      channel_id: post.channel_id,
-      root_id: post.id,
-      message: `⚠️ To save a discussion, mention me as a **reply inside a thread**. Try \`@${config.MM_BOT_USERNAME} help\` for the available commands.`,
-    });
-    return;
-  }
-
-  // Immediate acknowledgement — the full save flow can take many seconds
-  // (LLM merge, doc upload, indexing). Reply right away so the user knows
-  // the request was received.
-  client
-    .createPost({
-      channel_id: post.channel_id,
-      root_id: post.root_id,
-      message: "🔄 Carico il thread su Outline...",
-    })
-    .catch((err) => logger.warn({ err }, "ack_post_failed"));
-
-  let thread: Post[];
-  let userMap: Map<string, string>;
-  let triggeringUsername: string;
-
-  try {
-    const threadData = await client.getThread(post.root_id);
-    thread = sortThreadPosts(threadData);
-
-    const userIds = [...new Set(thread.map((p) => p.user_id))];
-    const usersArr = await client.getUsersByIds(userIds);
-    userMap = new Map(usersArr.map((u) => [u.id, u.username]));
-    triggeringUsername = userMap.get(post.user_id) ?? post.user_id;
-
-    logger.info({ thread_id: post.root_id, post_count: thread.length }, "thread_fetched");
-  } catch (err) {
-    logger.error({ err, root_id: post.root_id }, "thread_fetch_failed");
-    const shortError = formatUserError(err);
-    await client.createPost({
-      channel_id: post.channel_id,
-      root_id: post.root_id,
-      message: `⚠️ Sorry, something went wrong saving this thread: ${shortError}`,
-    });
-    return;
-  }
-
-  await withChannelLock(post.channel_id, async () => {
-    try {
-      const existingTopics = listTopicsByChannel(post.channel_id).map((t) => ({
-        slug: t.topic_slug,
-        displayName: t.topic_display_name,
-        summary: t.summary,
-      }));
-
-      const threadMessages = thread.map((p) => ({
-        timestamp: new Date(p.create_at).toISOString(),
-        username: userMap.get(p.user_id) ?? p.user_id,
-        message: p.message,
-      }));
-
-      const detection = await detectTopic({
-        channelName: channelRow.mm_channel_name,
-        rawCommand: command.raw,
-        explicitHashtag: command.explicitHashtag,
-        existingTopics,
-        threadMessages,
-      });
-
-      logger.info(
-        {
-          decision: detection.decision,
-          topic_slug: detection.topic_slug,
-          confidence: detection.confidence,
-          explicit_hashtag: command.explicitHashtag,
-        },
-        "topic_detected",
+    case "status": {
+      const collections = await getEffectiveCollections(outlineClient, logger, post.channel_id);
+      const lastSave = lastSuccessfulSaveStmt.get(post.channel_id) as
+        | { created_at: string; username: string; document_title: string | null; document_url: string | null }
+        | undefined;
+      const lastLine = lastSave
+        ? `Ultimo salvataggio: ${lastSave.created_at} da @${lastSave.username}` +
+          (lastSave.document_title ? ` → [${lastSave.document_title}](${lastSave.document_url ?? ""})` : "")
+        : "Ultimo salvataggio: nessuno";
+      await say(
+        `📚 **Stato del bot in ${channelRow.mm_channel_name}**\n` +
+          `Collection: ${collections.length > 0 ? collections.map((c) => c.name).join(", ") : "_nessuna_ (\`collezioni aggiungi\`)"}\n` +
+          `Proposte in attesa: ${countPendingProposals(post.channel_id)}\n` +
+          `${lastLine}\n` +
+          `Modello: \`${llmDescription()}\` · Approvazione: \`${config.SAVE_APPROVAL_MODE}\``,
       );
+      return;
+    }
 
-      const proceedDirectly =
-        command.explicitHashtag !== null ||
-        detection.confidence >= config.CONFIRMATION_CONFIDENCE_THRESHOLD;
-
-      if (!proceedDirectly) {
-        await requestConfirmation({
-          detection,
-          triggeringPost: post,
-          triggeringUsername,
-          thread,
-          threadUsernames: userMap,
-          channelId: post.channel_id,
-          teamName,
-          rawCommand: command.raw,
-          ttlMinutes: config.CONFIRMATION_TTL_MINUTES,
-          ctx: { mmClient: client, outlineClient, logger },
-        });
+    case "save": {
+      if (!post.root_id) {
+        await say(
+          `⚠️ Per salvare una discussione, menzionami **rispondendo dentro un thread**: \`@${config.MM_BOT_USERNAME} salva\`.`,
+        );
         return;
       }
-
-      const saveResult = await executeSave({
-        triggeringPost: post,
-        triggeringUsername,
-        thread,
-        threadUsernames: userMap,
-        channelId: post.channel_id,
-        teamName,
-        topicSlug: detection.topic_slug,
-        topicDisplayName: detection.topic_display_name,
-        ctx: { mmClient: client, outlineClient, logger },
-      });
-      const { documentUrl } = saveResult;
-
-      const lingering = findActivePendingByThreadRoot(post.root_id);
-      if (lingering) deletePendingById(lingering.id);
-
-      await client.createPost({
-        channel_id: post.channel_id,
-        root_id: post.root_id,
-        message: buildSavedMessage(saveResult),
-      });
-      logger.info({ channel_id: post.channel_id, root_id: post.root_id, document_url: documentUrl }, "save_completed");
-    } catch (err) {
-      logger.error({ err }, "save_failed");
-      const shortError = formatUserError(err);
-      await client.createPost({
-        channel_id: post.channel_id,
-        root_id: post.root_id,
-        message: `⚠️ Sorry, something went wrong saving this thread: ${shortError}`,
-      });
+      await withChannelLock(post.channel_id, () =>
+        startSaveProposal({
+          post,
+          hint: command.args || null,
+          teamName,
+          ctx: { mmClient: client, outlineClient, logger, botUserId },
+        }),
+      );
+      return;
     }
-  });
+  }
 }

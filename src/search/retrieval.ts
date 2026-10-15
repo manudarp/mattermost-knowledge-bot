@@ -5,6 +5,7 @@ export interface RetrievedChunk {
   docId: string;
   docTitle: string;
   docUrl: string;
+  collectionId: string;
   heading: string;
   content: string;
   score: number;
@@ -21,32 +22,32 @@ interface ChunkRow {
 }
 
 export interface SearchScope {
-  channelId?: string;
+  /** Restrict to these Outline collections (e.g. the ones linked to a channel). */
+  collectionIds?: string[];
   docPath?: string;       // Outline doc path, e.g. /doc/title-abc123
   collectionId?: string;  // Outline collection UUID
 }
 
-// Global retrieval — every chunk in the vector store.
-const allChunksStmt = db.prepare<[], ChunkRow>(
-  "SELECT doc_id, doc_title, doc_url, collection_id, heading, content, embedding FROM document_chunks",
-);
+const COLUMNS = "doc_id, doc_title, doc_url, collection_id, heading, content, embedding";
 
-// Per-channel retrieval — joins through topics so we only see chunks for docs
-// the bot created in this Mattermost channel.
-const chunksByChannelStmt = db.prepare<[string], ChunkRow>(`
-  SELECT dc.doc_id, dc.doc_title, dc.doc_url, dc.collection_id, dc.heading, dc.content, dc.embedding
-  FROM document_chunks dc
-  JOIN topics t ON t.outline_document_id = dc.doc_id
-  WHERE t.mm_channel_id = ?
-`);
+// Global retrieval — every chunk in the vector store.
+const allChunksStmt = db.prepare<[], ChunkRow>(`SELECT ${COLUMNS} FROM document_chunks`);
 
 // Outline page-context retrieval
 const chunksByDocPathStmt = db.prepare<[string], ChunkRow>(
-  "SELECT doc_id, doc_title, doc_url, collection_id, heading, content, embedding FROM document_chunks WHERE doc_url LIKE '%' || ?",
+  `SELECT ${COLUMNS} FROM document_chunks WHERE doc_url LIKE '%' || ?`,
 );
 const chunksByCollectionStmt = db.prepare<[string], ChunkRow>(
-  "SELECT doc_id, doc_title, doc_url, collection_id, heading, content, embedding FROM document_chunks WHERE collection_id = ?",
+  `SELECT ${COLUMNS} FROM document_chunks WHERE collection_id = ?`,
 );
+
+function chunksByCollections(ids: string[]): ChunkRow[] {
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => "?").join(",");
+  return db
+    .prepare<string[], ChunkRow>(`SELECT ${COLUMNS} FROM document_chunks WHERE collection_id IN (${placeholders})`)
+    .all(...ids);
+}
 
 function cosine(a: number[], b: number[]): number {
   let dot = 0, magA = 0, magB = 0;
@@ -59,33 +60,81 @@ function cosine(a: number[], b: number[]): number {
   return denom === 0 ? 0 : dot / denom;
 }
 
+function rowsForScope(scope?: SearchScope): ChunkRow[] {
+  if (scope?.collectionIds) return chunksByCollections(scope.collectionIds);
+  if (scope?.docPath) return chunksByDocPathStmt.all(scope.docPath);
+  if (scope?.collectionId) return chunksByCollectionStmt.all(scope.collectionId);
+  return allChunksStmt.all();
+}
+
+function scoreRows(queryVec: number[], rows: ChunkRow[]): RetrievedChunk[] {
+  return rows.map((row) => ({
+    docId: row.doc_id,
+    docTitle: row.doc_title,
+    docUrl: row.doc_url,
+    collectionId: row.collection_id,
+    heading: row.heading,
+    content: row.content,
+    score: cosine(queryVec, JSON.parse(row.embedding) as number[]),
+  }));
+}
+
 export async function search(
   query: string,
   topK = 5,
   scope?: SearchScope,
 ): Promise<RetrievedChunk[]> {
   const queryVec = await embedOne(query);
-
-  let rows: ChunkRow[];
-  if (scope?.channelId) {
-    rows = chunksByChannelStmt.all(scope.channelId);
-  } else if (scope?.docPath) {
-    rows = chunksByDocPathStmt.all(scope.docPath);
-  } else if (scope?.collectionId) {
-    rows = chunksByCollectionStmt.all(scope.collectionId);
-  } else {
-    rows = allChunksStmt.all();
-  }
-
-  const scored = rows.map((row) => ({
-    docId: row.doc_id,
-    docTitle: row.doc_title,
-    docUrl: row.doc_url,
-    heading: row.heading,
-    content: row.content,
-    score: cosine(queryVec, JSON.parse(row.embedding) as number[]),
-  }));
-
+  const scored = scoreRows(queryVec, rowsForScope(scope));
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, topK);
+}
+
+export interface RetrievedDocument {
+  docId: string;
+  docTitle: string;
+  docUrl: string;
+  collectionId: string;
+  score: number;
+  /** All indexed section headings of the document, in order. */
+  headings: string[];
+  /** Best-matching chunks, highest first. */
+  bestChunks: Array<{ heading: string; content: string; score: number }>;
+}
+
+/** Document-level retrieval: chunks grouped per document, ranked by best chunk. */
+export async function searchDocuments(
+  query: string,
+  topDocs: number,
+  scope?: SearchScope,
+): Promise<RetrievedDocument[]> {
+  const queryVec = await embedOne(query);
+  const scored = scoreRows(queryVec, rowsForScope(scope));
+
+  const byDoc = new Map<string, RetrievedDocument>();
+  for (const c of scored) {
+    let d = byDoc.get(c.docId);
+    if (!d) {
+      d = {
+        docId: c.docId,
+        docTitle: c.docTitle,
+        docUrl: c.docUrl,
+        collectionId: c.collectionId,
+        score: 0,
+        headings: [],
+        bestChunks: [],
+      };
+      byDoc.set(c.docId, d);
+    }
+    d.headings.push(c.heading);
+    d.bestChunks.push({ heading: c.heading, content: c.content, score: c.score });
+    d.score = Math.max(d.score, c.score);
+  }
+
+  const docs = [...byDoc.values()].sort((a, b) => b.score - a.score).slice(0, topDocs);
+  for (const d of docs) {
+    d.bestChunks.sort((a, b) => b.score - a.score);
+    d.bestChunks = d.bestChunks.slice(0, 2);
+  }
+  return docs;
 }
