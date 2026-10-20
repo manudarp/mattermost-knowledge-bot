@@ -11,10 +11,12 @@ import { startConfirmationCleanup } from "./jobs/confirmationCleanup.js";
 import { startIndexSync } from "./jobs/indexSync.js";
 import { ensureModelReady } from "./embedding/client.js";
 import { startApiServer } from "./api/server.js";
+import { llmDescription } from "./ai/client.js";
+import { ensurePinnedCollections } from "./core/collectionScope.js";
 
 async function main(): Promise<void> {
   logger.info(
-    { mm_url: config.MM_URL, outline_url: config.OUTLINE_URL, model: config.ANTHROPIC_MODEL },
+    { mm_url: config.MM_URL, outline_url: config.OUTLINE_URL, llm: llmDescription() },
     "bot_started",
   );
 
@@ -25,8 +27,13 @@ async function main(): Promise<void> {
     .map((r) => (r as { name: string }).name);
   logger.info({ tables }, "db_ready");
 
+  if (!config.LLM_BASE_URL && !config.ANTHROPIC_API_KEY) {
+    logger.warn("no LLM configured: set LLM_BASE_URL (+ LLM_API_KEY for hosted providers) or ANTHROPIC_API_KEY");
+  }
+
   const client = new MattermostClient(config.MM_URL, config.MM_BOT_TOKEN, logger);
   const outlineClient = new OutlineClient(config.OUTLINE_URL, config.OUTLINE_API_TOKEN, logger);
+  await ensurePinnedCollections(outlineClient, logger);
 
   let botUserId = config.MM_BOT_USER_ID;
   if (!botUserId) {
@@ -98,7 +105,7 @@ async function main(): Promise<void> {
     dispatch,
   });
 
-  const cleanupJob = startConfirmationCleanup(config.CLEANUP_INTERVAL_MINUTES, logger);
+  const cleanupJob = startConfirmationCleanup(config.CLEANUP_INTERVAL_MINUTES, client, logger);
 
   // Start embedding model check + Outline index sync
   try {

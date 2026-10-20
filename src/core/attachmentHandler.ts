@@ -3,39 +3,91 @@ import type { OutlineClient } from "../outline/client.js";
 import type { Logger } from "../logger.js";
 import { uploadAttachment } from "../outline/attachments.js";
 import { config } from "../config.js";
-import { extractTextFromFile, summarizeFile } from "./fileSummarizer.js";
+import { extractTextFromFile } from "./fileSummarizer.js";
 
-export interface AttachmentMapping {
+export interface ExtractedAttachment {
   fileId: string;
-  outlineUrl: string;
   filename: string;
   mimeType: string;
   isImage: boolean;
-  /** LLM-generated summary if the file content could be extracted. */
-  summary?: string;
-  /** Raw extracted text — fed to the section-merge AI so it can populate
-   * Summary/Decisions/Technical from the document content. */
-  extractedText?: string;
+  /** Raw extracted text, fed to the AI as authoritative source material. */
+  text?: string;
+  /** Non-image file whose text could not be extracted (scanned PDF, unsupported format…). */
+  unreadable: boolean;
 }
 
-export async function processThreadAttachments(opts: {
-  thread: Array<{ id: string; file_ids?: string[] }>;
-  documentId?: string;
-  ctx: { mmClient: MattermostClient; outlineClient: OutlineClient; logger: Logger };
-}): Promise<Map<string, AttachmentMapping>> {
-  const { thread, documentId, ctx } = opts;
-  const { mmClient, outlineClient, logger } = ctx;
+export interface UploadedAttachment {
+  fileId: string;
+  filename: string;
+  url: string;
+  isImage: boolean;
+}
 
-  const uniqueFileIds = new Set<string>();
-  for (const post of thread) {
-    for (const fid of post.file_ids ?? []) {
-      uniqueFileIds.add(fid);
+const MAX_TEXT_PER_FILE = 20_000;
+
+function collectFileIds(thread: Array<{ file_ids?: string[] }>): string[] {
+  const ids = new Set<string>();
+  for (const post of thread) for (const fid of post.file_ids ?? []) ids.add(fid);
+  return [...ids];
+}
+
+/**
+ * Downloads thread attachments from Mattermost and extracts their text.
+ * Nothing is uploaded to Outline here — that only happens once a proposal
+ * is approved (see uploadAttachments).
+ */
+export async function extractThreadAttachments(opts: {
+  thread: Array<{ file_ids?: string[] }>;
+  mmClient: MattermostClient;
+  logger: Logger;
+}): Promise<ExtractedAttachment[]> {
+  const { thread, mmClient, logger } = opts;
+  const out: ExtractedAttachment[] = [];
+
+  for (const fileId of collectFileIds(thread)) {
+    try {
+      const download = await mmClient.getFileBlob(fileId);
+      const isImage = download.mimeType.startsWith("image/");
+      let text: string | undefined;
+      if (!isImage) {
+        try {
+          const extracted = await extractTextFromFile(download.buffer, download.name, download.mimeType);
+          if (extracted.skipReason) {
+            logger.info({ fileId, filename: download.name, reason: extracted.skipReason }, "attachment_text_extraction_skipped");
+          } else if (extracted.text.trim().length > 0) {
+            text = extracted.text.slice(0, MAX_TEXT_PER_FILE);
+          }
+        } catch (err) {
+          logger.warn({ err, fileId, filename: download.name }, "attachment_text_extraction_failed");
+        }
+      }
+      out.push({
+        fileId,
+        filename: download.name,
+        mimeType: download.mimeType,
+        isImage,
+        ...(text !== undefined && { text }),
+        unreadable: !isImage && text === undefined,
+      });
+    } catch (err) {
+      logger.warn({ err, fileId }, "attachment_download_failed");
     }
   }
+  return out;
+}
 
-  const result = new Map<string, AttachmentMapping>();
+/** Re-downloads the given Mattermost files and uploads them to an Outline document. */
+export async function uploadAttachments(opts: {
+  fileIds: string[];
+  documentId: string;
+  mmClient: MattermostClient;
+  outlineClient: OutlineClient;
+  logger: Logger;
+}): Promise<UploadedAttachment[]> {
+  const { fileIds, documentId, mmClient, outlineClient, logger } = opts;
+  const out: UploadedAttachment[] = [];
 
-  for (const fileId of uniqueFileIds) {
+  for (const fileId of fileIds) {
     try {
       const download = await mmClient.getFileBlob(fileId);
       const attachment = await uploadAttachment(outlineClient, {
@@ -43,55 +95,15 @@ export async function processThreadAttachments(opts: {
         filename: download.name,
         mimeType: download.mimeType,
         size: download.size,
-        documentId, // <-- attach to the specific document if provided
+        documentId,
       });
-
-      const isImage = download.mimeType.startsWith("image/");
-
-      const outlineUrl = attachment.url.startsWith("/")
+      const url = attachment.url.startsWith("/")
         ? `${config.OUTLINE_URL.replace(/\/$/, "")}${attachment.url}`
         : attachment.url;
-
-      let summary: string | undefined;
-      let extractedText: string | undefined;
-      if (!isImage) {
-        try {
-          const extracted = await extractTextFromFile(
-            download.buffer,
-            download.name,
-            download.mimeType,
-          );
-          if (extracted.skipReason) {
-            logger.info(
-              { fileId, filename: download.name, reason: extracted.skipReason },
-              "attachment_text_extraction_skipped",
-            );
-          } else {
-            if (extracted.text.trim().length > 0) {
-              extractedText = extracted.text;
-            }
-            const s = await summarizeFile(extracted.text, download.name);
-            if (s) summary = s;
-          }
-        } catch (err) {
-          logger.warn({ err, fileId, filename: download.name }, "attachment_summary_failed");
-        }
-      }
-
-      const mapping: AttachmentMapping = {
-        fileId,
-        outlineUrl,
-        filename: download.name,
-        mimeType: download.mimeType,
-        isImage,
-        ...(summary !== undefined && { summary }),
-        ...(extractedText !== undefined && { extractedText }),
-      };
-      result.set(fileId, mapping);
+      out.push({ fileId, filename: download.name, url, isImage: download.mimeType.startsWith("image/") });
     } catch (err) {
-      logger.warn({ err, fileId }, "attachment_process_failed");
+      logger.warn({ err, fileId }, "attachment_upload_failed");
     }
   }
-
-  return result;
+  return out;
 }

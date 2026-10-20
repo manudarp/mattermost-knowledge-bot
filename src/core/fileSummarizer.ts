@@ -1,8 +1,4 @@
-import { callModel } from "../ai/client.js";
-
 const MAX_EXTRACT_BYTES = 5 * 1024 * 1024; // 5 MB
-const MIN_TEXT_CHARS = 80;
-const MAX_TEXT_FOR_LLM = 12000;
 
 const TEXT_EXTS = new Set([
   "txt", "md", "markdown", "json", "csv", "tsv", "log",
@@ -53,34 +49,4 @@ export async function extractTextFromFile(
   }
 
   return { text: "", skipReason: `unsupported format (.${ext} / ${mimeType})` };
-}
-
-export async function summarizeFile(text: string, filename: string): Promise<string | null> {
-  const trimmed = text.trim();
-  if (trimmed.length < MIN_TEXT_CHARS) return null;
-
-  // `/no_think` is Qwen 3.x's signal to skip the <think>...</think> reasoning
-  // phase. A file summary doesn't need chain-of-thought and skipping it
-  // halves latency and frees up the token budget for the actual answer.
-  const userPrompt = `/no_think
-
-Riassumi in italiano il seguente documento (nome file: ${filename}).
-
-Rispondi con:
-- Una frase di sintesi (max 25 parole)
-- 3-5 punti chiave come bullet list
-
-Documento:
-${trimmed.slice(0, MAX_TEXT_FOR_LLM)}`;
-
-  const result = await callModel({
-    systemPrompt:
-      "Sei un assistente che estrae riassunti brevi e concreti da documenti aziendali. Rispondi solo in italiano, senza preamboli.",
-    userPrompt,
-    maxTokens: 500,
-    temperature: 0.3,
-  });
-
-  const out = result.text.trim();
-  return out.length > 0 ? out : null;
 }

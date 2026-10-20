@@ -3,7 +3,7 @@ import type { Logger } from "../logger.js";
 
 export interface KnownWsEvent {
   event: "posted";
-  data: { post: string; channel_name?: string; sender_name?: string };
+  data: { post: string; channel_name?: string; channel_type?: string; sender_name?: string };
   broadcast: { channel_id: string; team_id: string };
 }
 

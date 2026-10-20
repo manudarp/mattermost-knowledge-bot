@@ -2,8 +2,8 @@ import type { WsEvent } from "../websocket.js";
 import type { MattermostClient } from "../client.js";
 import type { OutlineClient } from "../../outline/client.js";
 import type { Logger } from "../../logger.js";
-import { findPendingByBotReplyId } from "../../db/repositories/pendingConfirmations.js";
-import { resumeFromConfirmation } from "../../core/confirmationFlow.js";
+import { findProposalByBotReply } from "../../db/repositories/saveProposals.js";
+import { applyProposal, cancelProposal, canDecide } from "../../core/smartSave.js";
 import { withChannelLock } from "../../utils/locks.js";
 
 interface ReactionAddedCtx {
@@ -22,7 +22,8 @@ interface Reaction {
   create_at: number;
 }
 
-const CONFIRM_EMOJIS = new Set(["+1", "thumbsup"]);
+const APPROVE_EMOJIS = new Set(["+1", "thumbsup", "white_check_mark", "heavy_check_mark", "ballot_box_with_check"]);
+const CANCEL_EMOJIS = new Set(["-1", "thumbsdown", "x", "negative_squared_cross_mark", "no_entry_sign"]);
 
 export async function handleReactionAdded(event: ReactionAddedEvent, ctx: ReactionAddedCtx): Promise<void> {
   const { client, outlineClient, logger, botUserId } = ctx;
@@ -47,30 +48,34 @@ export async function handleReactionAdded(event: ReactionAddedEvent, ctx: Reacti
     return;
   }
 
-  if (!CONFIRM_EMOJIS.has(reaction.emoji_name)) return;
   if (reaction.user_id === botUserId) return;
+  const approve = APPROVE_EMOJIS.has(reaction.emoji_name);
+  const cancel = CANCEL_EMOJIS.has(reaction.emoji_name);
+  if (!approve && !cancel) return;
 
-  const pending = findPendingByBotReplyId(reaction.post_id);
-  if (!pending) return;
+  const proposal = findProposalByBotReply(reaction.post_id);
+  if (!proposal || proposal.status !== "pending") return;
+  if (new Date(proposal.expires_at).getTime() <= Date.now()) return;
 
-  logger.info(
-    {
-      pending_id: pending.id,
-      post_id: reaction.post_id,
-      user_id: reaction.user_id,
-      emoji: reaction.emoji_name,
-    },
-    "confirmation_reaction_received",
-  );
+  const [user] = await client.getUsersByIds([reaction.user_id]).catch(() => []);
+  const username = user?.username ?? reaction.user_id;
+  if (!canDecide(proposal, reaction.user_id, user?.username ?? null)) {
+    logger.info({ proposal_id: proposal.id, user_id: reaction.user_id }, "proposal_reaction_ignored_not_allowed");
+    return;
+  }
 
-  await withChannelLock(pending.mm_channel_id, async () => {
+  logger.info({ proposal_id: proposal.id, emoji: reaction.emoji_name, user_id: reaction.user_id }, "proposal_reaction_received");
+
+  const saveCtx = { mmClient: client, outlineClient, logger, botUserId };
+  await withChannelLock(proposal.mm_channel_id, async () => {
     try {
-      await resumeFromConfirmation({
-        pending,
-        ctx: { mmClient: client, outlineClient, logger },
-      });
+      if (approve) {
+        await applyProposal({ proposal, actorUserId: reaction.user_id, actorUsername: username, ctx: saveCtx });
+      } else {
+        await cancelProposal({ proposal, actorUsername: username, ctx: saveCtx });
+      }
     } catch (err) {
-      logger.error({ err, pending_id: pending.id }, "confirmation_reaction_resume_failed");
+      logger.error({ err, proposal_id: proposal.id }, "proposal_reaction_failed");
     }
   });
 }
