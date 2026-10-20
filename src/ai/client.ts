@@ -1,5 +1,6 @@
 import { config } from "../config.js";
 import { retryWithBackoff, HttpError, isNetworkError } from "../utils/retry.js";
+import { logger } from "../logger.js";
 import { Semaphore } from "../utils/semaphore.js";
 
 // Default is one LLM call at a time — llama.cpp is single-slot by default and
@@ -81,6 +82,8 @@ async function callOpenAICompatible(opts: CallModelOpts): Promise<CallModelResul
     // OpenRouter's unified reasoning control; only sent when configured because
     // other OpenAI-compatible servers may reject unknown parameters.
     ...(config.LLM_REASONING_EFFORT ? { reasoning: { effort: config.LLM_REASONING_EFFORT } } : {}),
+    ...(config.LLM_PROVIDER_PREFS ? { provider: config.LLM_PROVIDER_PREFS } : {}),
+    ...(config.LLM_FALLBACK_MODELS.length > 0 ? { models: config.LLM_FALLBACK_MODELS } : {}),
   };
 
   const headers: Record<string, string> = {
@@ -115,6 +118,9 @@ async function callOpenAICompatible(opts: CallModelOpts): Promise<CallModelResul
         }>;
         usage?: { prompt_tokens: number; completion_tokens: number };
         error?: { message?: string };
+        /** Model / upstream provider that actually served the request (OpenRouter). */
+        model?: string;
+        provider?: string;
       };
     },
     {
@@ -128,6 +134,20 @@ async function callOpenAICompatible(opts: CallModelOpts): Promise<CallModelResul
 
   // OpenRouter can return HTTP 200 with an `error` object (upstream failure).
   if (data.error) throw new Error(`LLM provider error: ${data.error.message ?? "unknown"}`);
+
+  // With routers, presets and fallbacks the requested model isn't necessarily
+  // the one that answered: log it, so data-residency choices can be audited.
+  logger.info(
+    {
+      requested_model: config.LLM_MODEL,
+      model: data.model ?? null,
+      provider: data.provider ?? null,
+      tokens_in: data.usage?.prompt_tokens ?? 0,
+      tokens_out: data.usage?.completion_tokens ?? 0,
+      finish_reason: data.choices?.[0]?.finish_reason ?? null,
+    },
+    "llm_call",
+  );
 
   const choice = data.choices?.[0];
   const rawText = contentToText(choice?.message?.content);

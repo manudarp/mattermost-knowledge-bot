@@ -86,6 +86,8 @@ Collections can be linked and unlinked at runtime from Mattermost — see [Manag
 | `LLM_MODEL` | no | `Qwen3.6-27B-UD-Q4_K_XL.gguf` | Model name, e.g. `anthropic/claude-sonnet-4.5` or `openai/gpt-4.1-mini` on OpenRouter |
 | `LLM_API_KEY` | no | — | Bearer token for the endpoint (required by hosted providers) |
 | `LLM_EXTRA_HEADERS` | no | — | Extra headers as JSON, e.g. `{"HTTP-Referer":"https://wiki.example.com","X-Title":"KB Bot"}` |
+| `LLM_PROVIDER_PREFS` | no | — | OpenRouter only: [provider routing](https://openrouter.ai/docs/features/provider-routing) object sent with every request, e.g. `{"zdr":true,"data_collection":"deny"}` |
+| `LLM_FALLBACK_MODELS` | no | — | OpenRouter only: comma-separated fallback models (sent as `models`) |
 | `LLM_MAX_CONCURRENCY` | no | `1` | Parallel LLM calls. Keep `1` for single-slot llama.cpp, raise (e.g. `4`) for hosted providers |
 | `LLM_TIMEOUT_MS` | no | `300000` | Per-request timeout |
 | `LLM_MAX_OUTPUT_TOKENS` | no | `16000` | When a reply comes back empty or cut off (typical of reasoning models that spend the budget thinking), the bot retries with a doubled token budget up to this cap |
@@ -103,6 +105,15 @@ LLM_MODEL=openai/gpt-4.1-mini
 LLM_MAX_CONCURRENCY=4
 LLM_NO_THINK_HINT=false
 ```
+
+#### Privacy with OpenRouter
+
+- `LLM_MODEL=@preset/<slug>` uses a [preset](https://openrouter.ai/docs/guides/features/presets) defined in the OpenRouter dashboard (models, fallbacks, provider rules), so models can be changed without touching `.env`.
+- A [guardrail](https://openrouter.ai/docs/guides/features/guardrails) on the bot's API key *enforces* the allowed models/providers, ZDR and a budget: anything else is rejected with 403. Guardrails restrict; they don't pick the model.
+- `LLM_PROVIDER_PREFS={"zdr":true,"data_collection":"deny"}` adds the same constraints per request.
+- EU processing: `LLM_BASE_URL=https://eu.openrouter.ai/api/v1` (Business/Enterprise plans).
+- Avoid `openrouter/free`: it picks a random free model, and many free endpoints retain or train on prompts.
+- Each call logs `llm_call` with the model and provider that actually answered.
 
 > Note: embeddings still run on Ollama (`OLLAMA_URL`), so the indexed wiki content never leaves your network; with a hosted LLM, however, the retrieved excerpts, the thread and the target document **are** sent to the provider.
 

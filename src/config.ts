@@ -58,6 +58,25 @@ const ConfigSchema = z.object({
       ctx.addIssue({ code: z.ZodIssueCode.custom, message: "must be a JSON object of header → value" });
       return z.NEVER;
     }),
+  // OpenRouter only: provider routing constraints sent with EVERY request, e.g.
+  // {"zdr":true,"data_collection":"deny","allow_fallbacks":false}. They add to
+  // (never relax) the account privacy settings and the key's guardrail.
+  LLM_PROVIDER_PREFS: z
+    .string()
+    .default("")
+    .transform((s, ctx) => {
+      if (!s.trim()) return null;
+      try {
+        const parsed: unknown = JSON.parse(s);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+      } catch {
+        /* fall through */
+      }
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "must be a JSON object (OpenRouter `provider` preferences)" });
+      return z.NEVER;
+    }),
+  // OpenRouter only: ordered fallback models tried if LLM_MODEL fails (sent as `models`).
+  LLM_FALLBACK_MODELS: csvList(false),
   // Parallel LLM calls. Keep 1 for single-slot llama.cpp; raise for remote providers.
   LLM_MAX_CONCURRENCY: z.coerce.number().int().positive().default(1),
   LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(300_000),
