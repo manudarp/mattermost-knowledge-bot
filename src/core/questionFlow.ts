@@ -96,7 +96,7 @@ export async function answerQuestion(opts: {
       const scope = collections.length > 0 ? { collectionIds: collections.map((c) => c.id) } : undefined;
       if (!scope) scopeNote = "\n_(nessuna collection collegata al canale: ho cercato in tutta la wiki)_";
       try {
-        chunks = (await search(query, 5, scope)).filter((c) => c.score >= config.SEARCH_SCORE_THRESHOLD);
+        chunks = await search(query, config.SEARCH_TOP_K, scope);
       } catch (err) {
         searchFailed = true;
         logger.warn({ err }, "kb_search_failed");
@@ -130,7 +130,13 @@ export async function answerQuestion(opts: {
     await mmClient.updatePost(progress.id, `${prefix}${body}${renderSources(sources)}${sources.length > 0 ? scopeNote : ""}`);
 
     logger.info(
-      { mode, answer_mode: answerMode, chunks: chunks.length, top_score: chunks[0]?.score ?? null },
+      {
+        mode,
+        answer_mode: answerMode,
+        chunks: chunks.length,
+        top_score: chunks[0]?.score ?? null,
+        keyword_hits: chunks.filter((c) => c.keywordRank !== null).length,
+      },
       "question_answered",
     );
   } catch (err) {

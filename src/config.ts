@@ -88,8 +88,44 @@ const ConfigSchema = z.object({
   // Append Qwen's `/no_think` switch to prompts. Harmless elsewhere, but can be disabled.
   LLM_NO_THINK_HINT: boolFlag(true),
 
+  // --- Embeddings ---------------------------------------------------------
+  //  ollama → local Ollama server (OLLAMA_URL)
+  //  openai → any OpenAI-compatible /embeddings endpoint (OpenRouter, Mistral, …)
+  EMBEDDING_PROVIDER: z.enum(["ollama", "openai"]).default("ollama"),
+  EMBEDDING_MODEL: z.string().default("bge-m3"),
+  EMBEDDING_BASE_URL: z.string().url().optional().or(z.literal("")),
+  // Falls back to LLM_API_KEY when empty (same OpenRouter account).
+  EMBEDDING_API_KEY: z.string().default(""),
+  // OpenRouter only: provider routing for embedding requests, e.g. {"zdr":true}
+  EMBEDDING_PROVIDER_PREFS: z
+    .string()
+    .default("")
+    .transform((s, ctx) => {
+      if (!s.trim()) return null;
+      try {
+        const parsed: unknown = JSON.parse(s);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+      } catch {
+        /* fall through */
+      }
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "must be a JSON object (OpenRouter `provider` preferences)" });
+      return z.NEVER;
+    }),
+  // Texts per embedding request. Small for a slow local CPU, larger for hosted APIs.
+  EMBEDDING_BATCH_SIZE: z.coerce.number().int().positive().max(256).default(8),
+  EMBEDDING_TIMEOUT_MS: z.coerce.number().int().positive().default(300_000),
+
   OLLAMA_URL: z.string().url().default("http://ollama:11434"),
   INDEX_SYNC_INTERVAL_MINUTES: z.coerce.number().int().positive().default(60),
+
+  // --- Chunking & retrieval ---------------------------------------------------
+  // Target size of an indexed chunk; sections longer than this are split.
+  CHUNK_MAX_CHARS: z.coerce.number().int().min(300).max(20_000).default(1800),
+  // Text repeated at the start of the next chunk when a section is split.
+  CHUNK_OVERLAP_CHARS: z.coerce.number().int().min(0).max(2000).default(200),
+  // Chunks passed to the LLM per answer, and max chunks from a single document.
+  SEARCH_TOP_K: z.coerce.number().int().positive().max(30).default(8),
+  SEARCH_MAX_CHUNKS_PER_DOC: z.coerce.number().int().positive().max(30).default(4),
 
   BOT_TRIGGER_MENTIONS: z
     .string()

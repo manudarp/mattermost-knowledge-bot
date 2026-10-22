@@ -121,8 +121,26 @@ LLM_NO_THINK_HINT=false
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `OLLAMA_URL` | no | `http://ollama:11434` | Ollama endpoint for bge-m3 embeddings |
-| `INDEX_SYNC_INTERVAL_MINUTES` | no | `60` | How often to re-index all Outline documents |
+| `EMBEDDING_PROVIDER` | no | `ollama` | `ollama` (local, `OLLAMA_URL`) or `openai` (any OpenAI-compatible `/embeddings` API, e.g. OpenRouter) |
+| `EMBEDDING_MODEL` | no | `bge-m3` | Embedding model. Changing it (or the provider) triggers a full re-index automatically |
+| `EMBEDDING_BASE_URL` | no | `LLM_BASE_URL` | Base URL for `openai` provider, e.g. `https://openrouter.ai/api/v1` |
+| `EMBEDDING_API_KEY` | no | `LLM_API_KEY` | API key for the `openai` provider |
+| `EMBEDDING_PROVIDER_PREFS` | no | — | OpenRouter only: provider routing for embeddings, e.g. `{"zdr":true,"data_collection":"deny"}` |
+| `EMBEDDING_BATCH_SIZE` | no | `8` | Texts per request: small for a slow local CPU, 32–128 for hosted APIs |
+| `EMBEDDING_TIMEOUT_MS` | no | `300000` | Per-request timeout |
+| `OLLAMA_URL` | no | `http://ollama:11434` | Ollama endpoint (provider `ollama`) |
+| `INDEX_SYNC_INTERVAL_MINUTES` | no | `60` | How often to re-index changed Outline documents. A sync never overlaps a running one |
+
+> With a hosted embedding provider, **the full text of every indexed document** is sent to it (once, and again when a document changes) — not just the excerpts used for answers. Choose a ZDR/EU provider accordingly. The Ollama sidecar can then be removed from `docker-compose.yml`.
+
+### Chunking & retrieval
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `CHUNK_MAX_CHARS` | no | `1800` | Target chunk size; longer sections are split on paragraph boundaries |
+| `CHUNK_OVERLAP_CHARS` | no | `200` | Text repeated between consecutive chunks of a split section |
+| `SEARCH_TOP_K` | no | `8` | Chunks passed to the LLM per answer |
+| `SEARCH_MAX_CHUNKS_PER_DOC` | no | `4` | Max chunks from a single document per answer |
 
 ### Questions
 
@@ -290,9 +308,9 @@ The widget automatically scopes search to the current context:
 
 ## RAG pipeline
 
-1. **Indexing** (background, every `INDEX_SYNC_INTERVAL_MINUTES`, and immediately after each applied save): fetches all Outline documents, splits into chunks by `##` heading, embeds via bge-m3 (Ollama), stores in SQLite with the document's collection. Moved documents are re-tagged, deleted ones are dropped.
-2. **Search**: embeds the query, computes cosine similarity against the chunks of the channel's collections, returns top-K.
-3. **Generation**: top-K chunks are passed as context to the LLM, which answers with source citations (or falls back to general knowledge when allowed).
+1. **Indexing** (background, every `INDEX_SYNC_INTERVAL_MINUTES`, and immediately after each applied save): fetches the Outline documents, splits them on **every heading level** into chunks of at most `CHUNK_MAX_CHARS` (long sections split on paragraphs, code blocks kept whole, with overlap), and embeds each chunk together with its title and heading path ("Gestione dati › Sincronizzatore › Servizi SOAP"). Vectors are stored as Float32 BLOBs in SQLite, and the same chunks feed an FTS5 keyword index. Unchanged documents are skipped, moved ones re-tagged, deleted ones dropped. Progress is logged every 25 documents (`outline_index_sync_progress`).
+2. **Search** (hybrid): the query is matched both semantically (cosine similarity on embeddings) and by keywords (BM25), and the two rankings are merged with Reciprocal Rank Fusion. Exact technical terms ("SOAP", "WSDL", table names) are found even when embeddings blur them. If the embedding backend is down, search falls back to keywords only.
+3. **Generation**: the top `SEARCH_TOP_K` chunks (at most `SEARCH_MAX_CHUNKS_PER_DOC` per document) are passed to the LLM, which answers with source citations.
 
 ## Troubleshooting
 
