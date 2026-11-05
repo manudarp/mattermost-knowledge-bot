@@ -523,7 +523,7 @@ function withAuditTrail(text: string, payload: ProposalPayload, approver: string
 
 async function reindex(ctx: SmartSaveCtx, doc: OutlineDocument, collectionId: string): Promise<void> {
   try {
-    await indexDocument(ctx.outlineClient, doc.id, doc.title, doc.text ?? "", doc.revision ?? 0, doc.url ?? "", collectionId);
+    await indexDocument(ctx.outlineClient, doc.id, doc.title, doc.text ?? "", doc.revision ?? 0, doc.url ?? "", collectionId, doc.updatedAt ?? null);
   } catch (err) {
     ctx.logger.warn({ err, docId: doc.id }, "inline_index_failed");
   }

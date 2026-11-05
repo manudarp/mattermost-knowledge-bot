@@ -11,6 +11,7 @@ export interface OutlineDocument {
   url?: string;
   deletedAt?: string | null;
   archivedAt?: string | null;
+  updatedAt?: string;
 }
 
 /** Absolute browser URL for a document (Outline returns `url` as a path). */
@@ -87,33 +88,23 @@ interface DocumentListResponse {
   pagination: { total: number; limit: number; offset: number };
 }
 
-export async function* listAllDocuments(client: OutlineClient): AsyncGenerator<OutlineDocument> {
-  const limit = 25;
-  let offset = 0;
-
-  while (true) {
-    const res = await client.post<DocumentListResponse>("/documents.list", {
+/**
+ * Lists every published document the token can read, newest first.
+ * List items carry metadata (id, title, url, collectionId, updatedAt) but only
+ * a truncated `text`: callers must fetch the full document with documents.info
+ * before indexing it.
+ */
+export async function* listDocuments(client: OutlineClient): AsyncGenerator<OutlineDocument> {
+  const limit = 100;
+  for (let offset = 0; ; offset += limit) {
+    const res = await client.post<DocumentListResponse | OutlineDocument[]>("/documents.list", {
       limit,
       offset,
       sort: "updatedAt",
       direction: "DESC",
     });
-
-    const docs: OutlineDocument[] = Array.isArray(res)
-      ? (res as OutlineDocument[])
-      : ((res as DocumentListResponse).data ?? []);
-
-    for (const doc of docs) {
-      // Fetch full text (list endpoint returns truncated text)
-      try {
-        const full = await client.post<OutlineDocument>("/documents.info", { id: doc.id });
-        yield full;
-      } catch {
-        yield doc;
-      }
-    }
-
+    const docs: OutlineDocument[] = Array.isArray(res) ? res : (res.data ?? []);
+    yield* docs;
     if (docs.length < limit) break;
-    offset += limit;
   }
 }

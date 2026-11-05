@@ -117,6 +117,8 @@ const ConfigSchema = z.object({
 
   OLLAMA_URL: z.string().url().default("http://ollama:11434"),
   INDEX_SYNC_INTERVAL_MINUTES: z.coerce.number().int().positive().default(60),
+  // Pause between full-document downloads during a sync, to stay under Outline's rate limiter.
+  OUTLINE_REQUEST_DELAY_MS: z.coerce.number().int().min(0).max(60_000).default(300),
 
   // --- Chunking & retrieval ---------------------------------------------------
   // Target size of an indexed chunk; sections longer than this are split.

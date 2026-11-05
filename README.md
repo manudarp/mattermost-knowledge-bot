@@ -130,6 +130,7 @@ LLM_NO_THINK_HINT=false
 | `EMBEDDING_TIMEOUT_MS` | no | `300000` | Per-request timeout |
 | `OLLAMA_URL` | no | `http://ollama:11434` | Ollama endpoint (provider `ollama`) |
 | `INDEX_SYNC_INTERVAL_MINUTES` | no | `60` | How often to re-index changed Outline documents. A sync never overlaps a running one |
+| `OUTLINE_REQUEST_DELAY_MS` | no | `300` | Pause between full-document downloads during a sync, to stay under Outline's rate limiter. Only documents whose `updatedAt` changed are downloaded |
 
 > With a hosted embedding provider, **the full text of every indexed document** is sent to it (once, and again when a document changes) — not just the excerpts used for answers. Choose a ZDR/EU provider accordingly. The Ollama sidecar can then be removed from `docker-compose.yml`.
 
@@ -328,6 +329,9 @@ For local LLMs, check `LLM_BASE_URL` is reachable from the bot container. For ho
 
 **"il modello ha restituito una risposta vuota"**
 Usually a reasoning model (R1, o-series, Qwen thinking…) that used its whole token budget on reasoning. The bot already retries with a larger budget; if it keeps happening, set `LLM_REASONING_EFFORT=low` (OpenRouter), raise `LLM_MAX_OUTPUT_TOKENS`, or use a non-reasoning model. The log line `ai_*_empty_or_truncated` shows `finish_reason` and the tokens used.
+
+**`429 rate_limit_exceeded` from Outline in the logs**
+Outline's rate limiter is slowing the bot down; the bot waits (honouring `Retry-After`) and retries, and a document that still fails is skipped and retried on the next sync. Unchanged documents are not downloaded at all, so this mostly happens on the first full sync. Raise `OUTLINE_REQUEST_DELAY_MS` (e.g. `1000`) or Outline's own limits (`RATE_LIMITER_REQUESTS`, `RATE_LIMITER_DURATION_WINDOW`). Make sure Outline sees real client IPs through the reverse proxy, otherwise all users share the bot's rate-limit bucket.
 
 **Proposal can't be applied ("il documento è cambiato…")**
 Someone edited or removed a section the proposal targeted. Reply `nota: rigenera` to redraft it against the current version.
