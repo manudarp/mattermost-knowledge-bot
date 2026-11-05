@@ -1,5 +1,5 @@
 import { describe, it, expect, afterAll } from "vitest";
-import Database from "better-sqlite3";
+import { DatabaseSync } from "node:sqlite";
 import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,8 +8,8 @@ const file = join(tmpdir(), `kb-bot-migration-test-${process.pid}-${Date.now()}.
 
 /** Builds a database as it looked before 004 (one collection per channel), with data. */
 function seedLegacyDb(path: string): void {
-  const db = new Database(path);
-  db.pragma("foreign_keys = ON");
+  const db = new DatabaseSync(path);
+  db.exec("PRAGMA foreign_keys = ON");
   db.exec("CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')))");
   for (const f of ["001_initial.sql", "002_rag.sql", "003_collection_id.sql"]) {
     db.exec(readFileSync(join("src/db/migrations", f), "utf8"));

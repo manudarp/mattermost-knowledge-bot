@@ -172,24 +172,28 @@ async function callAnthropic(opts: CallModelOpts): Promise<CallModelResult> {
   const { default: Anthropic } = await import("@anthropic-ai/sdk");
   const client = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
 
+  // API version 2026-10-21 (SDK 1.x) rejects sampling parameters, so
+  // opts.temperature only applies to OpenAI-compatible endpoints.
   const response = await client.messages.create({
     model: config.ANTHROPIC_MODEL,
     max_tokens: opts.maxTokens,
-    temperature: opts.temperature,
     system: opts.systemPrompt,
     messages: [{ role: "user", content: opts.userPrompt }],
   });
 
-  const textBlock = response.content.find((b) => b.type === "text");
-  if (!textBlock || textBlock.type !== "text") {
-    throw new Error("No text content in Claude response");
+  if (response.stop_reason === "refusal") {
+    throw new Error(`Claude declined the request (${response.stop_details?.category ?? "refusal"})`);
   }
 
+  // Thinking blocks may precede the answer; an output cut by max_tokens can
+  // carry no text at all — return "" so callModelJson retries with more room.
+  const text = response.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("");
+
   return {
-    text: textBlock.text,
+    text,
     finishReason: response.stop_reason ?? null,
     truncated: response.stop_reason === "max_tokens",
-    reasoned: false,
+    reasoned: response.content.some((b) => b.type === "thinking" || b.type === "redacted_thinking"),
     usage: {
       input: response.usage.input_tokens,
       output: response.usage.output_tokens,

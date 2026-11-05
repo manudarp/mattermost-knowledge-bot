@@ -1,5 +1,13 @@
-import "dotenv/config";
 import { z } from "zod";
+
+// Local development: load ./.env with Node's built-in parser (no dotenv
+// dependency). Variables already set in the environment win, so in Docker
+// (env_file / environment) this is a no-op; a missing file is fine.
+try {
+  process.loadEnvFile();
+} catch (err) {
+  if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+}
 
 const csvList = (lower: boolean) =>
   z

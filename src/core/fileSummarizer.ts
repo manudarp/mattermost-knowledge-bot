@@ -33,10 +33,15 @@ export async function extractTextFromFile(
   }
 
   if (ext === "pdf" || mimeType === "application/pdf") {
-    // pdf-parse is CJS — dynamic import keeps cold start cheap for non-PDF saves.
-    const { default: pdfParse } = (await import("pdf-parse")) as { default: (b: Buffer) => Promise<{ text: string }> };
-    const parsed = await pdfParse(buffer);
-    return { text: parsed.text ?? "", skipReason: null };
+    // Dynamic import keeps cold start cheap for non-PDF saves (pdf.js is large).
+    const { PDFParse } = await import("pdf-parse");
+    const parser = new PDFParse({ data: new Uint8Array(buffer) });
+    try {
+      const parsed = await parser.getText();
+      return { text: parsed.text ?? "", skipReason: null };
+    } finally {
+      await parser.destroy();
+    }
   }
 
   if (

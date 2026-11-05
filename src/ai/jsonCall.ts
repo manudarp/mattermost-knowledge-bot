@@ -9,7 +9,7 @@ export interface JsonCallOpts<T> {
   name: string;
   systemPrompt: string;
   userPrompt: string;
-  schema: z.ZodType<T, z.ZodTypeDef, unknown>;
+  schema: z.ZodType<T>;
   maxTokens: number;
   temperature: number;
   /** Extra semantic validation (e.g. "target id must exist"). Return an error
@@ -20,7 +20,7 @@ export interface JsonCallOpts<T> {
 
 async function tryParse<T>(
   text: string,
-  schema: z.ZodType<T, z.ZodTypeDef, unknown>,
+  schema: z.ZodType<T>,
   validate?: (value: T) => string | null | Promise<string | null>,
 ): Promise<T | { error: string }> {
   let parsed: unknown;

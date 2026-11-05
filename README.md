@@ -51,7 +51,7 @@ The bot only ever writes into collections linked to the channel, and re-checks t
 - Outline instance with an API token (Settings → API tokens). The token's user needs read/write access to the collections you want the bot to use (and permission to create collections if you use `collezioni crea` or `AUTO_CREATE_CHANNEL_COLLECTION`).
 - **Ollama** running with `bge-m3` pulled (`ollama pull bge-m3`). Used for embeddings.
 - An LLM: OpenAI-compatible endpoint (local llama.cpp/vLLM, or a hosted provider such as OpenRouter) **or** an Anthropic API key.
-- Node.js 20+ (local dev) or Docker 24+ with Compose v2 (production).
+- Node.js 26+ (64-bit) for local development, or Docker 24+ with Compose v2 (production). The database uses Node's built-in SQLite (`node:sqlite`): there is no native module to compile.
 
 ## Configuration
 
@@ -178,9 +178,9 @@ LLM_NO_THINK_HINT=false
 ## Local development
 
 ```bash
-npm install
+npm ci           # Node 26+; install scripts follow "allowScripts" in package.json
 cp .env.example .env
-# fill in .env
+# fill in .env (loaded with Node's built-in process.loadEnvFile)
 npm run dev        # hot-reload via tsx watch
 npm test           # unit + integration tests (no network)
 npm run typecheck  # TypeScript strict check

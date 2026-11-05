@@ -1,5 +1,5 @@
-import Database from "better-sqlite3";
 import { mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { Database } from "./sqlite.js";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config } from "../config.js";
@@ -8,7 +8,7 @@ import { logger } from "../logger.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(__dirname, "migrations");
 
-mkdirSync(dirname(config.DB_PATH), { recursive: true });
+if (config.DB_PATH !== ":memory:") mkdirSync(dirname(config.DB_PATH), { recursive: true });
 
 export const db = new Database(config.DB_PATH);
 db.pragma("journal_mode = WAL");
