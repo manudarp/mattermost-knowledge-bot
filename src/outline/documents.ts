@@ -11,6 +11,8 @@ export interface OutlineDocument {
   url?: string;
   deletedAt?: string | null;
   archivedAt?: string | null;
+  /** null for drafts, which documents.list (and so the periodic sync) skips. */
+  publishedAt?: string | null;
   updatedAt?: string;
 }
 

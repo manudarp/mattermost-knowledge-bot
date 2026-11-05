@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { OutlineClient } from "../outline/client.js";
 import { getDocument, listDocuments, type OutlineDocument } from "../outline/documents.js";
+import { HttpError } from "../utils/retry.js";
 import { chunkDocument, embeddingText } from "./chunker.js";
 import { embed, embeddingModelId } from "../embedding/client.js";
 import { vectorToBlob } from "../search/vectors.js";
@@ -86,10 +87,11 @@ export async function indexDocument(
   docUrl: string,
   collectionId = "",
   updatedAt: string | null = null,
+  opts: { force?: boolean } = {},
 ): Promise<boolean> {
   const hash = textHash(docText);
   const state = getStateStmt.get(docId);
-  if (state && state.doc_revision === docRevision) {
+  if (!opts.force && state && state.doc_revision === docRevision) {
     const sameText = state.text_hash === hash || (state.text_hash === null && chunksCoverText(docId, docText));
     if (sameText) {
       markCheckedStmt.run(updatedAt, hash, docId);
@@ -146,75 +148,189 @@ function unchangedSinceLastSync(doc: OutlineDocument): boolean {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-let currentSync: Promise<void> | null = null;
+export interface SyncStats {
+  force: boolean;
+  startedAt: string;
+  finishedAt: string | null;
+  seen: number;
+  indexed: number;
+  skipped: number;
+  failed: number;
+  pruned: number;
+  /** First few documents that could not be indexed, for the chat report. */
+  failures: Array<{ id: string; title: string; error: string }>;
+  /** Set when the whole sync aborted (e.g. Outline unreachable). */
+  error: string | null;
+}
+
+const MAX_REPORTED_FAILURES = 10;
+const LAST_SYNC_KEY = "last_index_sync";
+
+let currentSync: Promise<SyncStats> | null = null;
+let progress: SyncStats | null = null;
+
+/** Live counters of the running sync, or null when idle. */
+export function currentSyncProgress(): SyncStats | null {
+  return progress ? { ...progress, failures: [...progress.failures] } : null;
+}
+
+/** Result of the last completed sync (persisted across restarts). */
+export function lastSyncResult(): SyncStats | null {
+  const raw = getSettingStmt.get(LAST_SYNC_KEY)?.value;
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as SyncStats;
+  } catch {
+    return null;
+  }
+}
+
+export function indexStats(): { documents: number; chunks: number } {
+  const documents = (db.prepare("SELECT COUNT(*) AS n FROM index_state").get() as { n: number }).n;
+  return { documents, chunks: countChunksStmt.get()?.n ?? 0 };
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
 /**
  * Re-indexes every changed document. Only one sync runs at a time: with a slow
  * embedding backend a sync can outlast the interval, and overlapping runs would
- * compete for the same CPU and never finish.
+ * compete for the same CPU and never finish. A call made while a sync is
+ * running gets that sync's result.
+ *
+ * `force` downloads and re-embeds every document, ignoring change detection.
  */
-export function runFullSync(client: OutlineClient): Promise<void> {
+export function runFullSync(client: OutlineClient, opts: { force?: boolean } = {}): Promise<SyncStats> {
   if (currentSync) {
     logger.info("outline_index_sync_skipped_already_running");
     return currentSync;
   }
-  currentSync = doFullSync(client).finally(() => {
+  currentSync = doFullSync(client, opts.force ?? false).finally(() => {
     currentSync = null;
+    progress = null;
   });
   return currentSync;
 }
 
-async function doFullSync(client: OutlineClient): Promise<void> {
+/**
+ * True when Outline confirms the document is gone (deleted, archived or no
+ * longer readable by the bot). Any other error keeps it in the index: a
+ * document missed by the paginated listing (the list shifts while a long sync
+ * runs) must not be dropped and re-embedded on the next sync.
+ */
+async function confirmedGone(client: OutlineClient, docId: string): Promise<boolean> {
+  try {
+    const doc = await getDocument(client, docId);
+    return !!(doc.deletedAt || doc.archivedAt);
+  } catch (err) {
+    return err instanceof HttpError && [400, 403, 404].includes(err.status);
+  }
+}
+
+async function doFullSync(client: OutlineClient, force: boolean): Promise<SyncStats> {
   const t0 = Date.now();
-  logger.info("outline_index_sync_start");
-  let indexed = 0;
-  let skipped = 0;
-  let failed = 0;
+  const stats: SyncStats = {
+    force,
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    seen: 0,
+    indexed: 0,
+    skipped: 0,
+    failed: 0,
+    pruned: 0,
+    failures: [],
+    error: null,
+  };
+  progress = stats;
+  logger.info({ force }, "outline_index_sync_start");
   const seen = new Set<string>();
 
-  for await (const meta of listDocuments(client)) {
-    seen.add(meta.id);
-    try {
-      if (unchangedSinceLastSync(meta)) {
-        syncChunkMetaStmt.run(meta.collectionId ?? "", meta.title, meta.url ?? "", meta.id, meta.collectionId ?? "", meta.title, meta.url ?? "");
-        skipped++;
-      } else {
-        // Only changed (or never indexed) documents are downloaded, one at a
-        // time with a pause, to stay under Outline's rate limiter. A failed
-        // download is skipped and retried on the next sync — never indexed
-        // from the truncated text of the list.
-        if (config.OUTLINE_REQUEST_DELAY_MS > 0) await sleep(config.OUTLINE_REQUEST_DELAY_MS);
-        const doc = await getDocument(client, meta.id);
-        const changed = await indexDocument(
-          client, doc.id, doc.title, doc.text ?? "", doc.revision ?? 0, doc.url ?? "",
-          doc.collectionId ?? meta.collectionId ?? "", meta.updatedAt ?? doc.updatedAt ?? null,
-        );
-        if (changed) indexed++; else skipped++;
+  try {
+    for await (const meta of listDocuments(client)) {
+      if (seen.has(meta.id)) continue; // the list shifted under us
+      seen.add(meta.id);
+      stats.seen = seen.size;
+      try {
+        if (!force && unchangedSinceLastSync(meta)) {
+          syncChunkMetaStmt.run(meta.collectionId ?? "", meta.title, meta.url ?? "", meta.id, meta.collectionId ?? "", meta.title, meta.url ?? "");
+          stats.skipped++;
+        } else {
+          // Only changed (or never indexed) documents are downloaded, one at a
+          // time with a pause, to stay under Outline's rate limiter. A failed
+          // download is skipped and retried on the next sync — never indexed
+          // from the truncated text of the list.
+          if (config.OUTLINE_REQUEST_DELAY_MS > 0) await sleep(config.OUTLINE_REQUEST_DELAY_MS);
+          const doc = await getDocument(client, meta.id);
+          const changed = await indexDocument(
+            client, doc.id, doc.title, doc.text ?? "", doc.revision ?? 0, doc.url ?? "",
+            doc.collectionId ?? meta.collectionId ?? "", meta.updatedAt ?? doc.updatedAt ?? null,
+            { force },
+          );
+          if (changed) stats.indexed++; else stats.skipped++;
+        }
+      } catch (err) {
+        stats.failed++;
+        if (stats.failures.length < MAX_REPORTED_FAILURES) {
+          stats.failures.push({ id: meta.id, title: meta.title, error: errorText(err) });
+        }
+        logger.warn({ err, docId: meta.id, docTitle: meta.title }, "index_doc_failed");
       }
-    } catch (err) {
-      failed++;
-      logger.warn({ err, docId: meta.id, docTitle: meta.title }, "index_doc_failed");
+      if (seen.size % 25 === 0) {
+        logger.info(
+          { seen: seen.size, indexed: stats.indexed, skipped: stats.skipped, failed: stats.failed, minutes: Math.round((Date.now() - t0) / 60_000) },
+          "outline_index_sync_progress",
+        );
+      }
     }
-    if (seen.size % 25 === 0) {
-      logger.info({ seen: seen.size, indexed, skipped, failed, minutes: Math.round((Date.now() - t0) / 60_000) }, "outline_index_sync_progress");
+
+    // Anything indexed but not listed was probably deleted, archived or made
+    // inaccessible in Outline. Drop it once Outline confirms, so it can't be
+    // cited or proposed as a save target.
+    for (const { doc_id } of allIndexedDocIdsStmt.all()) {
+      if (seen.has(doc_id)) continue;
+      if (config.OUTLINE_REQUEST_DELAY_MS > 0) await sleep(config.OUTLINE_REQUEST_DELAY_MS);
+      if (await confirmedGone(client, doc_id)) {
+        removeDocumentFromIndex(doc_id);
+        stats.pruned++;
+      }
     }
+  } catch (err) {
+    // Listing failed (Outline down, token revoked…): keep the index as it is.
+    stats.error = errorText(err);
+    logger.error({ err }, "outline_index_sync_failed");
   }
 
-  // Listing completed without throwing → anything not seen was deleted,
-  // archived or made inaccessible in Outline. Drop it from the index so it
-  // can't be cited or proposed as a save target.
-  let pruned = 0;
-  for (const { doc_id } of allIndexedDocIdsStmt.all()) {
-    if (!seen.has(doc_id)) {
-      removeDocumentFromIndex(doc_id);
-      pruned++;
-    }
-  }
-
+  stats.finishedAt = new Date().toISOString();
+  setSettingStmt.run(LAST_SYNC_KEY, JSON.stringify(stats));
   logger.info(
-    { indexed, skipped, failed, pruned, minutes: Math.round(((Date.now() - t0) / 60_000) * 10) / 10 },
+    {
+      force,
+      indexed: stats.indexed,
+      skipped: stats.skipped,
+      failed: stats.failed,
+      pruned: stats.pruned,
+      error: stats.error,
+      minutes: Math.round(((Date.now() - t0) / 60_000) * 10) / 10,
+    },
     "outline_index_sync_done",
   );
+  return stats;
+}
+
+/** Downloads one document and re-indexes it now. `ref` is a UUID or urlId. */
+export async function indexSingleDocument(
+  client: OutlineClient,
+  ref: string,
+): Promise<{ doc: OutlineDocument; chunks: number }> {
+  const doc = await getDocument(client, ref);
+  await indexDocument(
+    client, doc.id, doc.title, doc.text ?? "", doc.revision ?? 0, doc.url ?? "",
+    doc.collectionId ?? "", doc.updatedAt ?? null, { force: true },
+  );
+  const chunks = (db.prepare("SELECT COUNT(*) AS n FROM document_chunks WHERE doc_id = ?").get(doc.id) as { n: number }).n;
+  return { doc, chunks };
 }
 
 export function removeDocumentFromIndex(docId: string): void {

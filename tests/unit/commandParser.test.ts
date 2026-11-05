@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseCommand, parseCollectionArgs, parseProposalReply } from "../../src/core/commandParser.js";
+import { parseCommand, parseCollectionArgs, parseProposalReply, parseIndexArgs } from "../../src/core/commandParser.js";
 
 describe("parseCommand", () => {
   it("empty string → unknown", () => {
@@ -145,5 +145,24 @@ describe("parseProposalReply", () => {
   it("ordinary messages are ignored", () => {
     expect(parseProposalReply("ciao a tutti")).toBeNull();
     expect(parseProposalReply("riunione: domani")).toBeNull();
+  });
+});
+
+describe("parseIndexArgs", () => {
+  it("routes the indicizza variants", () => {
+    expect(parseCommand("indicizza").subcommand).toBe("reindex");
+    expect(parseCommand("reindicizza tutto").args).toBe("tutto");
+    expect(parseIndexArgs("")).toEqual({ action: "sync" });
+    expect(parseIndexArgs("tutto")).toEqual({ action: "full" });
+    expect(parseIndexArgs("Completo")).toEqual({ action: "full" });
+    expect(parseIndexArgs("stato")).toEqual({ action: "status" });
+    expect(parseIndexArgs("https://docs.example.com/doc/api-soap-AbC123xyz0")).toEqual({
+      action: "document",
+      ref: "https://docs.example.com/doc/api-soap-AbC123xyz0",
+    });
+  });
+
+  it("does not hijack questions that start with 'indice'", () => {
+    expect(parseCommand("indice dei prezzi 2026?").subcommand).toBe("question");
   });
 });

@@ -304,8 +304,19 @@ The widget automatically scopes search to the current context:
 
 ```
 @wikibot help    # usage instructions
-@wikibot status  # linked collections, pending proposals, last save, LLM in use
+@wikibot status  # linked collections, pending proposals, last save, index size, LLM in use
 ```
+
+### Search index
+
+```
+@wikibot indicizza                  # index new/changed documents now; reports in the thread when done
+@wikibot indicizza <document link>  # index one document now and check it is searchable from this channel
+@wikibot indicizza stato            # indexed documents, running sync, last result and failures
+@wikibot indicizza tutto            # rebuild the whole index, re-embedding everything (BOT_ADMINS, slow)
+```
+
+`indicizza <link>` also explains why a document can't be found: the bot's Outline user can't read it, it's a draft (drafts are not synced), it has no text, or its collection isn't linked to the channel.
 
 ## RAG pipeline
 
@@ -323,6 +334,9 @@ Link one with `@wikibot collezioni aggiungi <nome>` or set `OUTLINE_COLLECTIONS`
 
 **Search returns no results**
 Check `embedding_model_ready` in startup logs. Verify Ollama is running and `bge-m3` is pulled. If `outline_index_sync_done` shows `indexed: 0`, check `OUTLINE_URL` and `OUTLINE_API_TOKEN`. Right after upgrading, documents are re-indexed on the first sync.
+
+**A recent document isn't found**
+Run `@wikibot indicizza <document link>` in the channel where you asked: it indexes the document immediately and tells you what's wrong (no access for the bot's Outline user, draft, empty, collection not linked to the channel). `@wikibot indicizza stato` lists the documents the last sync failed on.
 
 **LLM errors**
 For local LLMs, check `LLM_BASE_URL` is reachable from the bot container. For hosted providers, check `LLM_API_KEY` and `LLM_MODEL` (401/404 errors are not retried). If using Anthropic, verify `ANTHROPIC_API_KEY`.

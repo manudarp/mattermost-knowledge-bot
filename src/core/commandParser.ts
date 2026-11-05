@@ -4,6 +4,7 @@ export type Subcommand =
   | "ask"         // chiedi <domanda>          → general AI answer, no KB
   | "question"    // <testo libero>            → KB when relevant, otherwise general AI
   | "collections" // collezioni [azione] [...] → manage linked Outline collections
+  | "reindex"     // indicizza [tutto | <url documento>] → refresh the search index now
   | "help"
   | "status"
   | "unknown";    // bare mention, nothing to do
@@ -33,6 +34,9 @@ const KEYWORDS: Record<string, Subcommand> = {
   collezione: "collections",
   collections: "collections",
   collection: "collections",
+  indicizza: "reindex",
+  reindicizza: "reindex",
+  reindex: "reindex",
 };
 
 function stripQuotes(s: string): string {
@@ -75,6 +79,25 @@ const AVAILABLE = new Set(["disponibili", "available", "tutte", "all"]);
 const LIST = new Set(["", "lista", "list", "elenco", "attive"]);
 const CREATE = new Set(["crea", "create", "nuova", "new"]);
 const GLOBAL = new Set(["globale", "global", "globali", "tutti", "--globale", "--global"]);
+
+export type IndexAction =
+  | { action: "sync" }              // only changed / new documents
+  | { action: "full" }              // re-download and re-embed everything
+  | { action: "status" }
+  | { action: "document"; ref: string };
+
+const FULL = new Set(["tutto", "tutti", "completo", "completa", "forza", "full", "all", "--force"]);
+const INDEX_STATUS = new Set(["stato", "status", "info"]);
+
+/** `indicizza`, `indicizza tutto`, `indicizza stato`, `indicizza <url documento>`. */
+export function parseIndexArgs(args: string): IndexAction {
+  const t = stripQuotes(args.trim());
+  const first = (t.split(/\s+/)[0] ?? "").toLowerCase();
+  if (t === "") return { action: "sync" };
+  if (FULL.has(first)) return { action: "full" };
+  if (INDEX_STATUS.has(first)) return { action: "status" };
+  return { action: "document", ref: t };
+}
 
 /** `collezioni aggiungi [globale] Clienti, Progetti` → structured action. */
 export function parseCollectionArgs(args: string): CollectionAction {

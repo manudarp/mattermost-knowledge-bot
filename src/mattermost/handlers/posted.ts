@@ -22,6 +22,7 @@ import {
 } from "../../core/smartSave.js";
 import { findActiveProposalByThread, countPendingProposals } from "../../db/repositories/saveProposals.js";
 import { llmDescription } from "../../ai/client.js";
+import { handleIndexCommand, indexHelp, indexStatusLine } from "../../core/indexCommands.js";
 
 interface PostedCtx {
   client: MattermostClient;
@@ -125,6 +126,8 @@ Nessuna modifica viene applicata senza conferma: 👍/✅ o \`ok\` per applicare
 \`doc: …\`, \`collezione: …\`, \`sotto: …\`, \`titolo: …\`, \`nota: …\` per correggere la proposta.
 
 ${collectionsHelp()}
+
+${indexHelp()}
 
 **Altro**
 • \`${bot} status\` — collection collegate, proposte in attesa, ultimo salvataggio
@@ -249,6 +252,23 @@ export async function handlePosted(event: PostedEvent, ctx: PostedCtx): Promise<
       return;
     }
 
+    case "reindex": {
+      try {
+        const username = await usernameOf(client, post.user_id);
+        const message = await handleIndexCommand({
+          args: command.args,
+          channelId: post.channel_id,
+          username,
+          ctx: { outlineClient, logger, say },
+        });
+        await say(message);
+      } catch (err) {
+        logger.error({ err }, "index_command_failed");
+        await say(`⚠️ Errore: ${formatUserError(err)}`);
+      }
+      return;
+    }
+
     case "status": {
       const collections = await getEffectiveCollections(outlineClient, logger, post.channel_id);
       const lastSave = lastSuccessfulSaveStmt.get(post.channel_id) as
@@ -263,6 +283,7 @@ export async function handlePosted(event: PostedEvent, ctx: PostedCtx): Promise<
           `Collection: ${collections.length > 0 ? collections.map((c) => c.name).join(", ") : "_nessuna_ (\`collezioni aggiungi\`)"}\n` +
           `Proposte in attesa: ${countPendingProposals(post.channel_id)}\n` +
           `${lastLine}\n` +
+          `${indexStatusLine()}\n` +
           `Modello: \`${llmDescription()}\` · Approvazione: \`${config.SAVE_APPROVAL_MODE}\``,
       );
       return;

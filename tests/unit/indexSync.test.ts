@@ -12,7 +12,7 @@ vi.mock("../../src/embedding/client.js", () => ({
   embedOne: vi.fn(async () => [1, 0, 0]),
 }));
 
-const { runFullSync, ensureIndexMatchesEmbeddingModel } = await import("../../src/indexer/outlineIndexer.js");
+const { runFullSync, ensureIndexMatchesEmbeddingModel, indexSingleDocument, lastSyncResult, currentSyncProgress } = await import("../../src/indexer/outlineIndexer.js");
 const { HttpError } = await import("../../src/utils/retry.js");
 const { parseRetryAfter } = await import("../../src/outline/client.js");
 const { db } = await import("../../src/db/index.js");
@@ -30,24 +30,28 @@ const LONG = Array.from({ length: 12 }, (_, i) => `## Sezione ${i}\n${"Contenuto
 function makeOutline(docs: FakeDoc[]) {
   const infoCalls: string[] = [];
   const failing = new Set<string>();
+  const unreachable = new Set<string>();
+  const hiddenFromList = new Set<string>();
   const client = {
     async post(endpoint: string, body: Record<string, unknown>) {
       if (endpoint === "/documents.list") {
         if ((body.offset as number) > 0) return [];
         // The list only carries a truncated text, like Outline's.
-        return docs.map((d) => ({ ...d, text: d.text.slice(0, 50), url: `/doc/${d.id}`, collectionId: "col" }));
+        return docs.filter((d) => !hiddenFromList.has(d.id)).map((d) => ({ ...d, text: d.text.slice(0, 50), url: `/doc/${d.id}`, collectionId: "col" }));
       }
       if (endpoint === "/documents.info") {
         const id = String(body.id);
         infoCalls.push(id);
         if (failing.has(id)) throw new HttpError(429, "rate_limit_exceeded", "HTTP 429 POST /documents.info");
-        const d = docs.find((x) => x.id === id)!;
+        if (unreachable.has(id)) throw new Error("fetch failed: network");
+        const d = docs.find((x) => x.id === id);
+        if (!d) throw new HttpError(404, "not_found", "HTTP 404 POST /documents.info");
         return { ...d, url: `/doc/${d.id}`, collectionId: "col" };
       }
       throw new Error(`unexpected ${endpoint}`);
     },
   };
-  return { client: client as never, infoCalls, failing };
+  return { client: client as never, infoCalls, failing, unreachable, hiddenFromList };
 }
 
 const chunkChars = (docId: string) =>
@@ -119,6 +123,67 @@ describe("index sync", () => {
     // "full" was complete: verified once, not re-embedded.
     expect(embedCalls.flat().some((t) => t.startsWith("F"))).toBe(false);
     expect(embedCalls.flat().some((t) => t.startsWith("T"))).toBe(true);
+  });
+});
+
+describe("index sync — pruning, forced rebuild, single document", () => {
+  const docA = (): FakeDoc => ({ id: "a", title: "A", text: LONG, revision: 1, updatedAt: "2026-11-01T10:00:00Z" });
+  const docB = (): FakeDoc => ({ id: "b", title: "B", text: LONG, revision: 1, updatedAt: "2026-11-01T10:00:00Z" });
+  const indexed = () => (db.prepare("SELECT doc_id FROM index_state ORDER BY doc_id").all() as Array<{ doc_id: string }>).map((r) => r.doc_id);
+
+  it("keeps a document missing from the listing unless Outline confirms it is gone", async () => {
+    const docs = [docA(), docB()];
+    const outline = makeOutline(docs);
+    await runFullSync(outline.client);
+    expect(indexed()).toEqual(["a", "b"]);
+
+    // Missed by the paginated list but still readable → kept.
+    outline.hiddenFromList.add("b");
+    let stats = await runFullSync(outline.client);
+    expect(stats.pruned).toBe(0);
+    expect(indexed()).toEqual(["a", "b"]);
+
+    // Outline unreachable for it → kept as well.
+    outline.unreachable.add("b");
+    stats = await runFullSync(outline.client);
+    expect(indexed()).toEqual(["a", "b"]);
+
+    // Really deleted (404) → dropped.
+    outline.unreachable.delete("b");
+    docs.splice(1, 1);
+    stats = await runFullSync(outline.client);
+    expect(stats.pruned).toBe(1);
+    expect(indexed()).toEqual(["a"]);
+  });
+
+  it("reports failures and persists the last result", async () => {
+    const outline = makeOutline([docA(), docB()]);
+    outline.failing.add("b");
+    const stats = await runFullSync(outline.client);
+    expect(stats).toMatchObject({ seen: 2, indexed: 1, failed: 1, error: null });
+    expect(stats.failures[0]).toMatchObject({ id: "b", title: "B" });
+    expect(lastSyncResult()).toMatchObject({ indexed: 1, failed: 1 });
+    expect(currentSyncProgress()).toBeNull();
+  });
+
+  it("force re-embeds unchanged documents", async () => {
+    const outline = makeOutline([docA()]);
+    await runFullSync(outline.client);
+    embedCalls.length = 0;
+    outline.infoCalls.length = 0;
+
+    const stats = await runFullSync(outline.client, { force: true });
+    expect(outline.infoCalls).toEqual(["a"]);
+    expect(stats.indexed).toBe(1);
+    expect(embedCalls.length).toBeGreaterThan(0);
+  });
+
+  it("indexes a single document on demand", async () => {
+    const outline = makeOutline([docA()]);
+    const { doc, chunks } = await indexSingleDocument(outline.client, "a");
+    expect(doc.id).toBe("a");
+    expect(chunks).toBeGreaterThan(1);
+    expect(indexed()).toEqual(["a"]);
   });
 });
 

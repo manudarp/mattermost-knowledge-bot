@@ -21,7 +21,7 @@ export interface CollectionCommandCtx {
 
 const SCOPE_LABEL = { env: "da .env", global: "globale", channel: "questo canale" } as const;
 
-function isAdmin(username: string): boolean {
+export function isAdmin(username: string): boolean {
   return config.BOT_ADMINS.length === 0 || config.BOT_ADMINS.includes(username.toLowerCase());
 }
 
