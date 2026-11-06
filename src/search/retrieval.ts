@@ -90,10 +90,34 @@ function tokens(text: string): string[] {
   return text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
 }
 
-function queryTerms(query: string): string[] {
-  return [
-    ...new Set(tokens(query).filter((t) => (t.length >= 3 || /\d/.test(t)) && t.length <= 40 && !STOPWORDS.has(t))),
-  ].slice(0, MAX_QUERY_TERMS);
+/**
+ * Written like a code rather than a word: all capitals ("TIPDOC", "SOAP") or
+ * letters mixed with digits ("QTBFAT01"). Searched exactly: as a prefix,
+ * "TIPDOC" would also match the unrelated "TIPDOCA".
+ */
+export function isIdentifierLike(raw: string): boolean {
+  const hasLetter = /\p{L}/u.test(raw);
+  return (raw.length >= 3 && hasLetter && raw === raw.toUpperCase()) || (hasLetter && /\d/.test(raw));
+}
+
+interface QueryTerm {
+  term: string;
+  /** Match the whole word only (identifier-like terms). */
+  exact: boolean;
+}
+
+function queryTerms(query: string): QueryTerm[] {
+  const byTerm = new Map<string, QueryTerm>();
+  for (const raw of query.split(/[^\p{L}\p{N}]+/u)) {
+    const t = raw.toLowerCase();
+    // Single digits ("4.2" → "4", "2") match everything and carry no signal.
+    const meaningful = t.length >= 3 || (t.length === 2 && /\d/.test(t));
+    if (!meaningful || t.length > 40 || STOPWORDS.has(t)) continue;
+    const exact = isIdentifierLike(raw);
+    const prev = byTerm.get(t);
+    byTerm.set(t, { term: t, exact: exact || (prev?.exact ?? false) });
+  }
+  return [...byTerm.values()].slice(0, MAX_QUERY_TERMS);
 }
 
 /**
@@ -128,9 +152,9 @@ function buildConcepts(query: string, matched: GlossaryEntry[]): Concept[] {
   // Words that belong to a matched glossary alias are covered by that entry.
   const aliasWords = new Set(matched.flatMap((e) => e.aliases.flatMap((a) => tokens(a))));
   const singles: Concept[] = queryTerms(query)
-    .filter((t) => !aliasWords.has(t))
-    .map((t) => {
-      const prefix = t.length >= 5;
+    .filter(({ term }) => !aliasWords.has(term))
+    .map(({ term: t, exact }) => {
+      const prefix = !exact && t.length >= 5;
       const stem = prefix ? lightStem(t) : t;
       const n = normalize(stem);
       const re = new RegExp(`(^|[^\\p{L}\\p{N}])${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}${prefix ? "" : "($|[^\\p{L}\\p{N}])"}`, "u");

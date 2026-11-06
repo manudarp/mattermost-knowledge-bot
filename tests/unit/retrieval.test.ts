@@ -78,6 +78,17 @@ describe("Italian singular/plural", () => {
     expect(ftsQuery("ordine di vendita")).toBe('"ordin"* OR "vendit"*');
   });
 
+  it("searches code-like terms exactly and ignores single digits", async () => {
+    const { isIdentifierLike } = await import("../../src/search/retrieval.js");
+    expect(isIdentifierLike("TIPDOC")).toBe(true);
+    expect(isIdentifierLike("QTBFAT01")).toBe(true);
+    expect(isIdentifierLike("Tipdoc")).toBe(false);
+    expect(isIdentifierLike("4")).toBe(false);
+    // "TIPDOC" must not match "TIPDOCA"; "campo" also finds "campi"; "4.2" adds nothing.
+    expect(ftsQuery("cosa rappresenta il campo TIPDOC in AHRW 4.2?")).toBe('"rappresent"* OR "camp"* OR "tipdoc" OR "ahrw"');
+    expect(ftsQuery("tipdoc")).toBe('"tipdoc"*');
+  });
+
   it("finds the plural when the question uses the singular", async () => {
     await indexDocument(client, "doc-ordini", "Gestione Ordini Clienti", "## Inserimento\nGli ordini clienti si inseriscono dalla gestione vendite.", 1, "/doc/ordini", "col-c");
     const res = await search("come inserisco un ordine di vendita?", 8, { collectionIds: ["col-c"] });
