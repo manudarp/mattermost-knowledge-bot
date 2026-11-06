@@ -252,17 +252,17 @@ describe("LLM re-ranking", () => {
   });
 
   it("searches short follow-ups together with the previous question when decomposition is off", async () => {
-    // Alone, "e per gli acquisti?" matches nothing.
-    expect(await search("e per gli acquisti?", 8, undefined, { rerank: false, decompose: false })).toEqual([]);
+    // Alone, "e per i resi?" matches nothing.
+    expect(await search("e per i resi?", 8, undefined, { rerank: false, decompose: false })).toEqual([]);
 
-    const chunks = await search("e per gli acquisti?", 8, undefined, {
+    const chunks = await search("e per i resi?", 8, undefined, {
       conversationHint: "@anna: come funzionano i documenti in AHRW?",
       followUpOf: "come funzionano i documenti in AHRW?",
       decompose: false,
     });
     expect(chunks.map((c) => c.docId)).toEqual(["doc-general"]);
     // The re-ranker judges the real question, with the conversation as context.
-    expect(prompts[0]).toContain("Domanda: e per gli acquisti?");
+    expect(prompts[0]).toContain("Domanda: e per i resi?");
     expect(prompts[0]).toContain("@anna: come funzionano i documenti in AHRW?");
   });
 

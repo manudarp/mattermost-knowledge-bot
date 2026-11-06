@@ -107,16 +107,26 @@ function phraseExpr(alias: string): string | null {
   return `"${t.join(" ")}"`;
 }
 
+/**
+ * Minimal Italian stemming for prefix search: drop the final vowel so that
+ * singular and plural (ordine/ordini, vendita/vendite, documento/documenti)
+ * share a prefix. Only for words of 5+ letters, leaving a stem of 4+.
+ */
+export function lightStem(word: string): string {
+  return word.length >= 5 && /[aeiouàèéìòù]$/i.test(word) ? word.slice(0, -1) : word;
+}
+
 function buildConcepts(query: string, matched: GlossaryEntry[]): Concept[] {
   // Words that belong to a matched glossary alias are covered by that entry.
   const aliasWords = new Set(matched.flatMap((e) => e.aliases.flatMap((a) => tokens(a))));
   const singles: Concept[] = queryTerms(query)
     .filter((t) => !aliasWords.has(t))
     .map((t) => {
-      const n = normalize(t);
       const prefix = t.length >= 5;
+      const stem = prefix ? lightStem(t) : t;
+      const n = normalize(stem);
       const re = new RegExp(`(^|[^\\p{L}\\p{N}])${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}${prefix ? "" : "($|[^\\p{L}\\p{N}])"}`, "u");
-      return { label: t, fts: [prefix ? `"${t}"*` : `"${t}"`], matches: (text: string) => re.test(text) };
+      return { label: t, fts: [prefix ? `"${stem}"*` : `"${t}"`], matches: (text: string) => re.test(text) };
     });
   const entries: Concept[] = matched.map((e) => {
     const aliases = e.aliases.map(normalize);
@@ -320,7 +330,7 @@ export interface SearchTrace {
   rerankError: string | null;
 }
 
-const MAX_TRACE = 25;
+const MAX_TRACE = 45;
 
 interface Evaluated {
   e: Ranked;
@@ -425,7 +435,8 @@ export async function searchWithTrace(
   };
 
   // Merge the sub-searches round-robin so every product gets its share.
-  const limit = rerank ? Math.max(topK, config.SEARCH_RERANK_CANDIDATES) : topK;
+  const rerankCandidates = config.SEARCH_RERANK_CANDIDATES ?? (config.SEARCH_RERANK_PROVIDER === "api" ? 40 : 20);
+  const limit = rerank ? Math.max(topK, rerankCandidates) : topK;
   const perDoc = new Map<string, number>();
   const taken = new Set<number>();
   const candidates: Array<{ e: Ranked; t: TraceCandidate | null }> = [];

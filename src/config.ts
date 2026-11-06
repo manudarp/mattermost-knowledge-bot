@@ -161,7 +161,12 @@ const ConfigSchema = z.object({
   // queries (searched separately) and completes short follow-ups from the thread.
   // Only called when the question looks multi-part or is a follow-up.
   SEARCH_DECOMPOSE: boolFlag(true),
-  SEARCH_RERANK_CANDIDATES: z.coerce.number().int().min(2).max(40).default(20),
+  // Passages sent to the re-ranker. Empty = 20 with the chat model (each costs
+  // tokens), 40 with a dedicated reranker (`api`, cheap per passage).
+  SEARCH_RERANK_CANDIDATES: z.preprocess(
+    (v) => (v === "" ? undefined : v),
+    z.coerce.number().int().min(2).max(60).optional(),
+  ),
   // 3 = answers the question, 2 = useful, 1 = marginal / special case, 0 = unrelated.
   SEARCH_RERANK_MIN_SCORE: z.coerce.number().int().min(1).max(3).default(2),
   //  llm → the chat model (LLM_*) rates the passages

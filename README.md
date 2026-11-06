@@ -147,7 +147,7 @@ LLM_NO_THINK_HINT=false
 | `SEARCH_GLOSSARY` | no | — | Acronyms/synonyms, e.g. `AHRW=Ad hoc Revolution Web; G1=Gestionale 1\|Gestionale uno`. When a question uses one form, the others are searched too. Also editable from chat |
 | `SEARCH_DECOMPOSE` | no | `true` | Before searching, the LLM splits a multi-part question ("gestione documenti in Gestionale 1 e in AHRW?") into 2–3 self-contained queries, each searched separately and merged, and rewrites short follow-ups ("e per gli acquisti?") into complete questions using the thread. Only called when the question contains a joining word (e, o, rispetto, differenze…) or is a follow-up; on failure a single search is used |
 | `SEARCH_RERANK` | no | `true` | The LLM reads the best `SEARCH_RERANK_CANDIDATES` passages and keeps only those rated ≥ `SEARCH_RERANK_MIN_SCORE` (3 answers, 2 useful, 1 marginal, 0 unrelated). One short extra LLM call per question; on failure the hybrid order is used |
-| `SEARCH_RERANK_CANDIDATES` | no | `20` | Passages sent to the re-ranker |
+| `SEARCH_RERANK_CANDIDATES` | no | 20 / 40 | Passages sent to the re-ranker: 20 with the chat model (each costs tokens), 40 with a dedicated reranker (`api`) |
 | `SEARCH_RERANK_MIN_SCORE` | no | `2` | Minimum re-ranker score to reach the answer |
 | `SEARCH_RERANK_PROVIDER` | no | `llm` | `llm`: the chat model rates passages 0–3. `api`: a dedicated reranker model (cross-encoder such as Qwen3-Reranker or bge-reranker-v2-m3) scores them 0–1 via a `/rerank` endpoint — cheaper and faster, no text generated |
 | `RERANK_BASE_URL` | for `api` | — | `https://openrouter.ai/api/v1`, a llama.cpp server started with `--reranking` (`http://reranker:8080/v1`), or Hugging Face TEI (`http://reranker:80`) |

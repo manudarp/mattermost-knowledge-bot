@@ -60,11 +60,29 @@ beforeAll(async () => {
 describe("ftsQuery", () => {
   it("drops stopwords, quotes terms and uses prefix match on longer ones", () => {
     expect(ftsQuery("come funzionano le API SOAP del sincronizzatore?")).toBe(
-      '"funzionano"* OR "api" OR "soap" OR "sincronizzatore"*',
+      '"funzionan"* OR "api" OR "soap" OR "sincronizzator"*',
     );
     expect(ftsQuery("e il la?")).toBeNull();
     // User quotes never reach FTS syntax; "con" is a stopword.
-    expect(ftsQuery('test "con" virgolette')).toBe('"test" OR "virgolette"*');
+    expect(ftsQuery('test "con" virgolette')).toBe('"test" OR "virgolett"*');
+  });
+});
+
+describe("Italian singular/plural", () => {
+  it("stems long words so the prefix matches both forms", async () => {
+    const { lightStem } = await import("../../src/search/retrieval.js");
+    expect(lightStem("ordine")).toBe("ordin");
+    expect(lightStem("vendita")).toBe("vendit");
+    expect(lightStem("api")).toBe("api");
+    expect(lightStem("crea")).toBe("crea");
+    expect(ftsQuery("ordine di vendita")).toBe('"ordin"* OR "vendit"*');
+  });
+
+  it("finds the plural when the question uses the singular", async () => {
+    await indexDocument(client, "doc-ordini", "Gestione Ordini Clienti", "## Inserimento\nGli ordini clienti si inseriscono dalla gestione vendite.", 1, "/doc/ordini", "col-c");
+    const res = await search("come inserisco un ordine di vendita?", 8, { collectionIds: ["col-c"] });
+    expect(res[0]?.docId).toBe("doc-ordini");
+    expect(res[0]?.keywordRank).toBe(1);
   });
 });
 
