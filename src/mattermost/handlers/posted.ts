@@ -23,6 +23,7 @@ import {
 import { findActiveProposalByThread, countPendingProposals } from "../../db/repositories/saveProposals.js";
 import { llmDescription } from "../../ai/client.js";
 import { handleIndexCommand, indexHelp, indexStatusLine } from "../../core/indexCommands.js";
+import { glossaryHelp, handleDebugCommand, handleGlossaryCommand } from "../../core/searchCommands.js";
 
 interface PostedCtx {
   client: MattermostClient;
@@ -128,6 +129,8 @@ Nessuna modifica viene applicata senza conferma: 👍/✅ o \`ok\` per applicare
 ${collectionsHelp()}
 
 ${indexHelp()}
+
+${glossaryHelp()}
 
 **Altro**
 • \`${bot} status\` — collection collegate, proposte in attesa, ultimo salvataggio
@@ -264,6 +267,29 @@ export async function handlePosted(event: PostedEvent, ctx: PostedCtx): Promise<
         await say(message);
       } catch (err) {
         logger.error({ err }, "index_command_failed");
+        await say(`⚠️ Errore: ${formatUserError(err)}`);
+      }
+      return;
+    }
+
+    case "glossary": {
+      try {
+        const username = await usernameOf(client, post.user_id);
+        await say(handleGlossaryCommand({ args: command.args, username }));
+      } catch (err) {
+        logger.error({ err }, "glossary_command_failed");
+        await say(`⚠️ Errore: ${formatUserError(err)}`);
+      }
+      return;
+    }
+
+    case "debug": {
+      try {
+        await say(
+          await handleDebugCommand({ query: command.args.trim(), channelId: post.channel_id, ctx: { outlineClient, logger } }),
+        );
+      } catch (err) {
+        logger.error({ err }, "debug_command_failed");
         await say(`⚠️ Errore: ${formatUserError(err)}`);
       }
       return;

@@ -10,6 +10,7 @@ vi.mock("../../src/embedding/client.js", () => ({
     return texts.map(() => [1, 0, 0]);
   }),
   embedOne: vi.fn(async () => [1, 0, 0]),
+  embedQuery: vi.fn(async () => [1, 0, 0]),
 }));
 
 const { runFullSync, ensureIndexMatchesEmbeddingModel, indexSingleDocument, lastSyncResult, currentSyncProgress } = await import("../../src/indexer/outlineIndexer.js");

@@ -50,6 +50,25 @@ async function threadConversation(post: Post, ctx: QuestionCtx): Promise<Convers
   }
 }
 
+/** The last few thread messages, short, so the re-ranker understands follow-up questions. */
+export function conversationHint(conversation: ConversationMessage[]): string | undefined {
+  const recent = conversation.slice(-3);
+  if (recent.length === 0) return undefined;
+  return recent
+    .map((m) => `${m.isBot ? "Assistente" : `@${m.username}`}: ${m.message.replace(/\s+/g, " ").slice(0, 300)}`)
+    .join("\n");
+}
+
+const FOLLOW_UP_MAX_WORDS = 8;
+
+/** For a short question in a thread, the previous question by a person (to search both together). */
+export function followUpOf(query: string, conversation: ConversationMessage[]): string | undefined {
+  if (query.split(/\s+/).filter(Boolean).length > FOLLOW_UP_MAX_WORDS) return undefined;
+  const previous = [...conversation].reverse().find((m) => !m.isBot && m.message.trim());
+  const text = previous?.message.replace(/@[\w.-]+/g, "").replace(/\s+/g, " ").trim();
+  return text ? text.slice(0, 500) : undefined;
+}
+
 function renderSources(sources: Array<{ title: string; url: string; heading: string }>): string {
   const seen = new Set<string>();
   const unique = sources.filter((s) => {
@@ -96,7 +115,10 @@ export async function answerQuestion(opts: {
       const scope = collections.length > 0 ? { collectionIds: collections.map((c) => c.id) } : undefined;
       if (!scope) scopeNote = "\n_(nessuna collection collegata al canale: ho cercato in tutta la wiki)_";
       try {
-        chunks = await search(query, config.SEARCH_TOP_K, scope);
+        chunks = await search(query, config.SEARCH_TOP_K, scope, {
+          conversationHint: conversationHint(conversation),
+          followUpOf: followUpOf(query, conversation),
+        });
       } catch (err) {
         searchFailed = true;
         logger.warn({ err }, "kb_search_failed");

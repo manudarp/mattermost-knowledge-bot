@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeAll } from "vitest";
 
+// The LLM re-ranker has its own tests (searchQuality.test.ts).
+process.env.SEARCH_RERANK = "false";
+
 // Deterministic fake embedding: one dimension per topic word. "soap" is
 // deliberately NOT a dimension, so only the keyword index can find it —
 // exactly the weakness of pure semantic search on technical acronyms.
@@ -16,6 +19,10 @@ vi.mock("../../src/embedding/client.js", () => ({
     return texts.map(fakeVec);
   }),
   embedOne: vi.fn(async (text: string) => {
+    if (embeddingDown) throw new Error("down");
+    return fakeVec(text);
+  }),
+  embedQuery: vi.fn(async (text: string) => {
     if (embeddingDown) throw new Error("down");
     return fakeVec(text);
   }),

@@ -142,6 +142,14 @@ LLM_NO_THINK_HINT=false
 | `CHUNK_OVERLAP_CHARS` | no | `200` | Text repeated between consecutive chunks of a split section |
 | `SEARCH_TOP_K` | no | `8` | Chunks passed to the LLM per answer |
 | `SEARCH_MAX_CHUNKS_PER_DOC` | no | `4` | Max chunks from a single document per answer |
+| `SEARCH_RELATIVE_MARGIN` | no | `0.15` | Semantic matches scoring more than this below the best one are dropped (embedding scores are compressed: unrelated text often scores 0.35–0.45 with bge-m3) |
+| `SEARCH_KEYWORD_MIN_COVERAGE` | no | `0.4` | A keyword-only match must contain this share of the query's distinctive terms, weighted by rarity — one generic word ("documenti") is not enough |
+| `SEARCH_GLOSSARY` | no | — | Acronyms/synonyms, e.g. `AHRW=Ad hoc Revolution Web; G1=Gestionale 1\|Gestionale uno`. When a question uses one form, the others are searched too. Also editable from chat |
+| `SEARCH_RERANK` | no | `true` | The LLM reads the best `SEARCH_RERANK_CANDIDATES` passages and keeps only those rated ≥ `SEARCH_RERANK_MIN_SCORE` (3 answers, 2 useful, 1 marginal, 0 unrelated). One short extra LLM call per question; on failure the hybrid order is used |
+| `SEARCH_RERANK_CANDIDATES` | no | `20` | Passages sent to the re-ranker |
+| `SEARCH_RERANK_MIN_SCORE` | no | `2` | Minimum re-ranker score to reach the answer |
+| `EMBEDDING_QUERY_PREFIX` | no | — | Instruction prepended to queries only (Qwen3-Embedding needs one; `
+` = newline). Changing it does not require re-indexing |
 
 ### Questions
 
@@ -316,12 +324,22 @@ The widget automatically scopes search to the current context:
 @wikibot indicizza tutto            # rebuild the whole index, re-embedding everything (BOT_ADMINS, slow)
 ```
 
+### Glossary and search debugging
+
+```
+@wikibot glossario                                        # list acronyms/synonyms
+@wikibot glossario aggiungi AHRW = Ad hoc Revolution Web  # BOT_ADMINS; alternatives with |
+@wikibot glossario rimuovi AHRW
+@wikibot debug come funziona la gestione documenti in AHRW?   # which passages the search found, scores, why each was kept or dropped
+```
+
 `indicizza <link>` also explains why a document can't be found: the bot's Outline user can't read it, it's a draft (drafts are not synced), it has no text, or its collection isn't linked to the channel.
 
 ## RAG pipeline
 
 1. **Indexing** (background, every `INDEX_SYNC_INTERVAL_MINUTES`, and immediately after each applied save): fetches the Outline documents, splits them on **every heading level** into chunks of at most `CHUNK_MAX_CHARS` (long sections split on paragraphs, code blocks kept whole, with overlap), and embeds each chunk together with its title and heading path ("Gestione dati › Sincronizzatore › Servizi SOAP"). Vectors are stored as Float32 BLOBs in SQLite, and the same chunks feed an FTS5 keyword index. Unchanged documents are skipped, moved ones re-tagged, deleted ones dropped. Progress is logged every 25 documents (`outline_index_sync_progress`).
 2. **Search** (hybrid): the query is matched both semantically (cosine similarity on embeddings) and by keywords (BM25), and the two rankings are merged with Reciprocal Rank Fusion. Exact technical terms ("SOAP", "WSDL", table names) are found even when embeddings blur them. If the embedding backend is down, search falls back to keywords only.
+   Then three filters keep marginal passages out: semantic matches must be within `SEARCH_RELATIVE_MARGIN` of the best one; keyword-only matches must cover enough of the question's distinctive terms; finally the LLM re-ranks the survivors and keeps those that actually answer the question (`SEARCH_RERANK`). Acronyms from the glossary are searched in all their forms, and short follow-up questions in a thread are searched together with the previous question.
 3. **Generation**: the top `SEARCH_TOP_K` chunks (at most `SEARCH_MAX_CHUNKS_PER_DOC` per document) are passed to the LLM, which answers with source citations.
 
 ## Troubleshooting

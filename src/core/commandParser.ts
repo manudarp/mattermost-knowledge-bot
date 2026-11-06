@@ -5,6 +5,8 @@ export type Subcommand =
   | "question"    // <testo libero>            → KB when relevant, otherwise general AI
   | "collections" // collezioni [azione] [...] → manage linked Outline collections
   | "reindex"     // indicizza [tutto | <url documento>] → refresh the search index now
+  | "glossary"    // glossario [aggiungi X = Y | rimuovi X] → acronyms/synonyms for search
+  | "debug"       // debug <domanda>           → show what the search found and why
   | "help"
   | "status"
   | "unknown";    // bare mention, nothing to do
@@ -37,6 +39,10 @@ const KEYWORDS: Record<string, Subcommand> = {
   indicizza: "reindex",
   reindicizza: "reindex",
   reindex: "reindex",
+  glossario: "glossary",
+  glossary: "glossary",
+  sigle: "glossary",
+  debug: "debug",
 };
 
 function stripQuotes(s: string): string {
@@ -97,6 +103,31 @@ export function parseIndexArgs(args: string): IndexAction {
   if (FULL.has(first)) return { action: "full" };
   if (INDEX_STATUS.has(first)) return { action: "status" };
   return { action: "document", ref: t };
+}
+
+export type GlossaryAction =
+  | { action: "list" }
+  | { action: "add"; definition: string }
+  | { action: "remove"; term: string }
+  | { action: "invalid"; reason: string };
+
+/** `glossario`, `glossario aggiungi AHRW = Ad hoc Revolution Web`, `glossario rimuovi AHRW`. */
+export function parseGlossaryArgs(args: string): GlossaryAction {
+  const trimmed = args.trim();
+  const first = (trimmed.split(/\s+/)[0] ?? "").toLowerCase();
+  const rest = trimmed.slice(first.length).trim();
+  if (LIST.has(first)) return { action: "list" };
+  if (ADD.has(first)) {
+    return rest.includes("=")
+      ? { action: "add", definition: rest }
+      : { action: "invalid", reason: "usa il formato `SIGLA = significato` (alternative separate da `|`)" };
+  }
+  if (REMOVE.has(first)) {
+    return rest ? { action: "remove", term: stripQuotes(rest) } : { action: "invalid", reason: "specifica la sigla da rimuovere" };
+  }
+  // `glossario AHRW = Ad hoc Revolution Web` without the verb.
+  if (trimmed.includes("=")) return { action: "add", definition: trimmed };
+  return { action: "invalid", reason: `azione sconosciuta "${first}"` };
 }
 
 /** `collezioni aggiungi [globale] Clienti, Progetti` → structured action. */

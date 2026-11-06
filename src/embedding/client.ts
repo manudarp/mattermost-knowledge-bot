@@ -107,6 +107,11 @@ export async function embedOne(text: string): Promise<number[]> {
   return vecs[0];
 }
 
+/** Embeds a search query, with the model-specific instruction prefix if configured. */
+export async function embedQuery(query: string): Promise<number[]> {
+  return embedOne(`${config.EMBEDDING_QUERY_PREFIX}${query}`);
+}
+
 export async function ensureModelReady(): Promise<void> {
   if (config.EMBEDDING_PROVIDER === "openai") {
     const t0 = Date.now();

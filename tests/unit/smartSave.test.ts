@@ -23,6 +23,9 @@ vi.mock("../../src/embedding/client.js", () => ({
   embedOne: vi.fn(async () => {
     throw new Error("ollama down");
   }),
+  embedQuery: vi.fn(async () => {
+    throw new Error("ollama down");
+  }),
 }));
 
 const { startSaveProposal, applyProposal, reviseProposal } = await import("../../src/core/smartSave.js");

@@ -122,6 +122,14 @@ const ConfigSchema = z.object({
   // Texts per embedding request. Small for a slow local CPU, larger for hosted APIs.
   EMBEDDING_BATCH_SIZE: z.coerce.number().int().positive().max(256).default(8),
   EMBEDDING_TIMEOUT_MS: z.coerce.number().int().positive().default(300_000),
+  // Text prepended to search queries (not to documents) before embedding. Some
+  // models are trained with an instruction, e.g. Qwen3-Embedding:
+  // "Instruct: Given a question, retrieve passages that answer it\nQuery: "
+  // Use "\n" for a newline.
+  EMBEDDING_QUERY_PREFIX: z
+    .string()
+    .default("")
+    .transform((s) => s.replace(/\\n/g, "\n")),
 
   OLLAMA_URL: z.string().url().default("http://ollama:11434"),
   INDEX_SYNC_INTERVAL_MINUTES: z.coerce.number().int().positive().default(60),
@@ -136,6 +144,22 @@ const ConfigSchema = z.object({
   // Chunks passed to the LLM per answer, and max chunks from a single document.
   SEARCH_TOP_K: z.coerce.number().int().positive().max(30).default(8),
   SEARCH_MAX_CHUNKS_PER_DOC: z.coerce.number().int().positive().max(30).default(4),
+  // Semantic matches scoring more than this below the best one are dropped,
+  // whatever SEARCH_SCORE_THRESHOLD says (embedding scores are compressed:
+  // with bge-m3 even unrelated text often scores 0.35–0.45).
+  SEARCH_RELATIVE_MARGIN: z.coerce.number().min(0).max(1).default(0.15),
+  // A keyword-only match must contain this share of the query's distinctive
+  // terms (weighted by rarity), so one generic word like "documenti" isn't enough.
+  SEARCH_KEYWORD_MIN_COVERAGE: z.coerce.number().min(0).max(1).default(0.4),
+  // Acronyms / synonyms used to widen searches, e.g.
+  // "AHRW=Ad hoc Revolution Web; G1=Gestionale 1|Gestionale uno". More can be added from chat (`glossario`).
+  SEARCH_GLOSSARY: z.string().default(""),
+  // The LLM picks, among the best candidates, the passages that really answer
+  // the question (one extra short call per question).
+  SEARCH_RERANK: boolFlag(true),
+  SEARCH_RERANK_CANDIDATES: z.coerce.number().int().min(2).max(40).default(20),
+  // 3 = answers the question, 2 = useful, 1 = marginal / special case, 0 = unrelated.
+  SEARCH_RERANK_MIN_SCORE: z.coerce.number().int().min(1).max(3).default(2),
 
   BOT_TRIGGER_MENTIONS: z
     .string()
@@ -157,7 +181,7 @@ const ConfigSchema = z.object({
 
   // Free-text questions not grounded in the KB are answered by the LLM directly.
   GENERAL_QA_ENABLED: boolFlag(true),
-  SEARCH_SCORE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.3),
+  SEARCH_SCORE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.4),
 
   // Save flow (human-in-the-loop)
   //  always            → every change must be approved in Mattermost
