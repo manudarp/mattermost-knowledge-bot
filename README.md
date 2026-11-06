@@ -1,16 +1,17 @@
 # Mattermost Knowledge Bot
 
-A self-hosted AI knowledge assistant that connects Mattermost and Outline wiki. It captures thread discussions into structured wiki documents and enables semantic search over the entire wiki — both from Mattermost chat and via a floating chat widget embedded directly in Outline pages.
+A self-hosted AI knowledge assistant that connects Mattermost and an Outline wiki. It answers questions from the wiki (or from general AI knowledge), and turns thread discussions into wiki content — finding the right collection and document to update, and **only writing after a human approves the proposed change**. A floating chat widget also lets you query the wiki directly from Outline pages.
 
-All inference runs locally: embeddings via Ollama (bge-m3) and answer generation via a local LLM (tested with Qwen 3 27B on llama.cpp). No data leaves your network.
+Inference can run fully locally (embeddings via Ollama `bge-m3`, answers via llama.cpp/vLLM) or use a hosted OpenAI-compatible provider such as OpenRouter, or Anthropic.
 
 ## Features
 
-- **Save threads to wiki** — mention the bot in any Mattermost thread to save it to Outline, with AI-powered topic detection and section merging
-- **Semantic search from chat** — `@wikibot cerca <question>` searches the wiki using RAG and replies with a cited answer
-- **Outline chat widget** — a floating chat bubble embedded in Outline pages, context-aware (scopes search to the current document or collection, falls back to full wiki)
-- **Local LLM** — drop-in support for any OpenAI-compatible endpoint (llama.cpp, vLLM, etc.) instead of Anthropic
-- **Concurrency queue** — single-slot semaphore on LLM calls with live queue-depth feedback to users
+- **Multiple collections, managed from chat** — link any set of Outline collections to a channel (or bot-wide) with `@wikibot collezioni aggiungi …`; questions read from all of them, saves write into the most fitting one. Collections can also be pinned in `.env`.
+- **Questions: KB, general or both** — `@wikibot <question>` answers from the wiki when relevant documents exist, otherwise as a general assistant (clearly labelled). `cerca` forces wiki-only answers, `chiedi` forces a general answer. Follow-ups in a thread keep the conversation context.
+- **Smart saving with human-in-the-loop** — `@wikibot salva [hint]` in a thread: the bot looks at the collections' document trees and at semantically similar documents, decides whether to **update an existing document** (with section-level edits) or **create a new one** in the right collection/parent, and posts a preview. Nothing is written until the requester (or a configured approver) confirms. The proposal can be redirected (`doc:`, `collezione:`, `sotto:`), renamed (`titolo:`) or regenerated with instructions (`nota:`).
+- **Safe edits** — existing documents are never rewritten wholesale: the LLM proposes operations on named sections (`append_to_section`, `replace_section`, `add_section`) that are applied deterministically, so untouched content is preserved byte-for-byte and edits can be re-applied if someone changed the document meanwhile. Every touched document gets an audit line (who, when, what, link to the thread).
+- **Any OpenAI-compatible LLM** — llama.cpp, vLLM, OpenRouter, OpenAI, Groq… with API key, extra headers and configurable concurrency; or Anthropic.
+- **Outline chat widget** — a floating chat bubble embedded in Outline pages, scoped to the current document or collection.
 
 ## Architecture
 
@@ -19,28 +20,38 @@ Mattermost  ──WS──▶  bot  ──REST──▶  Outline
                       │
                       ├──REST──▶  Ollama (bge-m3 embeddings)
                       │
-                      ├──REST──▶  LLM (local via llama.cpp / Anthropic fallback)
+                      ├──REST──▶  LLM (OpenAI-compatible: local or OpenRouter… / Anthropic)
                       │
                       └──HTTP:3333──▶  Widget API  ◀──  Outline browser widget
 
 Storage: SQLite  ./data/kb-bot.db
-  ├── topics          (channel → Outline document mapping)
-  ├── document_chunks (chunked wiki content + embeddings)
-  ├── index_state     (per-doc revision tracking)
-  └── pending_confirmations
+  ├── channels / channel_collections  (which Outline collections each channel may use; '*' = all channels)
+  ├── save_proposals                  (pending/applied/cancelled KB changes, with their preview)
+  ├── saves                           (audit of applied changes)
+  ├── document_chunks + index_state   (chunked wiki content + embeddings)
+  └── topics / pending_confirmations  (legacy, no longer used)
 ```
 
-The bot authenticates to Mattermost via WebSocket, listens for mentions, and writes structured Markdown into Outline. A background job re-indexes all Outline documents on a configurable interval, enabling semantic search.
+A background job re-indexes all Outline documents the token can see every `INDEX_SYNC_INTERVAL_MINUTES` (and drops deleted ones); search is then filtered to the collections linked to the channel.
+
+### How a save works
+
+1. `@wikibot salva aggiorna la fase 2 del progetto ACME` in a thread.
+2. The bot reads the thread (+ text of attached PDF/DOCX/text files), the document trees of the channel's collections and the most similar documents (semantic search).
+3. **Placement** (LLM): update document X, or create "ACME — Fase 2" in collection Y under parent Z.
+4. **Drafting** (LLM): section-level edits for an existing document (dry-run validated against the real document), or the body of the new document.
+5. The bot posts a **proposal** with the target path, confidence, reasoning and a preview of every change.
+6. 👍/✅ or `ok` → the change is applied (attachments uploaded, audit line added, document re-indexed). 👎/❌ or `annulla` → discarded. Unanswered proposals expire after `CONFIRMATION_TTL_MINUTES`.
+
+The bot only ever writes into collections linked to the channel, and re-checks this at approval time.
 
 ## Prerequisites
 
 - Mattermost bot account (System Console → Integrations → Bot Accounts). The bot must be a member of the team(s) it serves.
-- Outline instance with an API token (Settings → API tokens). The token's user needs permission to create collections and documents.
+- Outline instance with an API token (Settings → API tokens). The token's user needs read/write access to the collections you want the bot to use (and permission to create collections if you use `collezioni crea` or `AUTO_CREATE_CHANNEL_COLLECTION`).
 - **Ollama** running with `bge-m3` pulled (`ollama pull bge-m3`). Used for embeddings.
-- **Local LLM** via an OpenAI-compatible endpoint (recommended: llama.cpp with Qwen 3 27B), **or** an Anthropic API key.
-- Node.js 20+ (local dev) or Docker 24+ with Compose v2 (production).
-
-> **Outline collection visibility**: collections created by the bot use `permission: "read"` — all Outline users can read every channel's wiki. Adjust if you serve private channels with sensitive data.
+- An LLM: OpenAI-compatible endpoint (local llama.cpp/vLLM, or a hosted provider such as OpenRouter) **or** an Anthropic API key.
+- Node.js 26+ (64-bit) for local development, or Docker 24+ with Compose v2 (production). The database uses Node's built-in SQLite (`node:sqlite`): there is no native module to compile.
 
 ## Configuration
 
@@ -56,31 +67,116 @@ Copy `.env.example` to `.env` and fill in required values.
 | `MM_BOT_USER_ID` | no | auto-resolved | Bot user ID; resolved at startup if blank |
 | `OUTLINE_URL` | yes | — | Outline base URL |
 | `OUTLINE_API_TOKEN` | yes | — | Outline API token |
+| `BOT_ADMINS` | no | — (everyone) | Usernames allowed to manage bot-wide collections and create collections |
+
+### Collections
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `OUTLINE_COLLECTIONS` | no | — | Comma-separated collection names/URLs/IDs available in **every** channel (pinned; cannot be removed from chat) |
+| `AUTO_CREATE_CHANNEL_COLLECTION` | no | `false` | Legacy behaviour: create and link a dedicated collection when the bot joins a channel |
+
+Collections can be linked and unlinked at runtime from Mattermost — see [Managing collections](#managing-collections).
 
 ### LLM
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `LLM_BASE_URL` | no | — | OpenAI-compatible base URL (e.g. `http://localhost:8020`). When set, overrides Anthropic. |
-| `LLM_MODEL` | no | `Qwen3.6-27B-UD-Q4_K_XL.gguf` | Model name sent to the OpenAI-compatible endpoint |
+| `LLM_BASE_URL` | no | — | OpenAI-compatible base URL. Both `http://localhost:8020` and `https://openrouter.ai/api/v1` styles work. When set, overrides Anthropic. |
+| `LLM_MODEL` | no | `Qwen3.6-27B-UD-Q4_K_XL.gguf` | Model name, e.g. `anthropic/claude-sonnet-4.5` or `openai/gpt-4.1-mini` on OpenRouter |
+| `LLM_API_KEY` | no | — | Bearer token for the endpoint (required by hosted providers) |
+| `LLM_EXTRA_HEADERS` | no | — | Extra headers as JSON, e.g. `{"HTTP-Referer":"https://wiki.example.com","X-Title":"KB Bot"}` |
+| `LLM_PROVIDER_PREFS` | no | — | OpenRouter only: [provider routing](https://openrouter.ai/docs/features/provider-routing) object sent with every request, e.g. `{"zdr":true,"data_collection":"deny"}` |
+| `LLM_FALLBACK_MODELS` | no | — | OpenRouter only: comma-separated fallback models (sent as `models`) |
+| `LLM_MAX_CONCURRENCY` | no | `1` | Parallel LLM calls. Keep `1` for single-slot llama.cpp, raise (e.g. `4`) for hosted providers |
+| `LLM_TIMEOUT_MS` | no | `300000` | Per-request timeout |
+| `LLM_MAX_OUTPUT_TOKENS` | no | `16000` | When a reply comes back empty or cut off (typical of reasoning models that spend the budget thinking), the bot retries with a doubled token budget up to this cap |
+| `LLM_REASONING_EFFORT` | no | — | OpenRouter only: `low`/`medium`/`high` reasoning effort for thinking models; `low` makes saves faster and avoids empty replies |
+| `LLM_NO_THINK_HINT` | no | `true` | Append Qwen's `/no_think` switch to prompts |
 | `ANTHROPIC_API_KEY` | no | — | Anthropic API key (used only when `LLM_BASE_URL` is not set) |
 | `ANTHROPIC_MODEL` | no | `claude-haiku-4-5-20251001` | Anthropic model |
+
+Example for OpenRouter:
+
+```env
+LLM_BASE_URL=https://openrouter.ai/api/v1
+LLM_API_KEY=sk-or-v1-...
+LLM_MODEL=openai/gpt-4.1-mini
+LLM_MAX_CONCURRENCY=4
+LLM_NO_THINK_HINT=false
+```
+
+#### Privacy with OpenRouter
+
+- `LLM_MODEL=@preset/<slug>` uses a [preset](https://openrouter.ai/docs/guides/features/presets) defined in the OpenRouter dashboard (models, fallbacks, provider rules), so models can be changed without touching `.env`.
+- A [guardrail](https://openrouter.ai/docs/guides/features/guardrails) on the bot's API key *enforces* the allowed models/providers, ZDR and a budget: anything else is rejected with 403. Guardrails restrict; they don't pick the model.
+- `LLM_PROVIDER_PREFS={"zdr":true,"data_collection":"deny"}` adds the same constraints per request.
+- EU processing: `LLM_BASE_URL=https://eu.openrouter.ai/api/v1` (Business/Enterprise plans).
+- Avoid `openrouter/free`: it picks a random free model, and many free endpoints retain or train on prompts.
+- Each call logs `llm_call` with the model and provider that actually answered.
+
+> Note: embeddings still run on Ollama (`OLLAMA_URL`), so the indexed wiki content never leaves your network; with a hosted LLM, however, the retrieved excerpts, the thread and the target document **are** sent to the provider.
 
 ### Embeddings
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `OLLAMA_URL` | no | `http://ollama:11434` | Ollama endpoint for bge-m3 embeddings |
-| `INDEX_SYNC_INTERVAL_MINUTES` | no | `60` | How often to re-index all Outline documents |
+| `EMBEDDING_PROVIDER` | no | `ollama` | `ollama` (local, `OLLAMA_URL`) or `openai` (any OpenAI-compatible `/embeddings` API, e.g. OpenRouter) |
+| `EMBEDDING_MODEL` | no | `bge-m3` | Embedding model. Changing it (or the provider) triggers a full re-index automatically |
+| `EMBEDDING_BASE_URL` | no | `LLM_BASE_URL` | Base URL for `openai` provider, e.g. `https://openrouter.ai/api/v1` |
+| `EMBEDDING_API_KEY` | no | `LLM_API_KEY` | API key for the `openai` provider |
+| `EMBEDDING_PROVIDER_PREFS` | no | — | OpenRouter only: provider routing for embeddings, e.g. `{"zdr":true,"data_collection":"deny"}` |
+| `EMBEDDING_BATCH_SIZE` | no | `8` | Texts per request: small for a slow local CPU, 32–128 for hosted APIs |
+| `EMBEDDING_TIMEOUT_MS` | no | `300000` | Per-request timeout |
+| `OLLAMA_URL` | no | `http://ollama:11434` | Ollama endpoint (provider `ollama`) |
+| `INDEX_SYNC_INTERVAL_MINUTES` | no | `60` | How often to re-index changed Outline documents. A sync never overlaps a running one |
+| `OUTLINE_REQUEST_DELAY_MS` | no | `300` | Pause between full-document downloads during a sync, to stay under Outline's rate limiter. Only documents whose `updatedAt` changed are downloaded |
 
-### Bot behaviour
+> With a hosted embedding provider, **the full text of every indexed document** is sent to it (once, and again when a document changes) — not just the excerpts used for answers. Choose a ZDR/EU provider accordingly. The Ollama sidecar can then be removed from `docker-compose.yml`.
+
+### Chunking & retrieval
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `BOT_TRIGGER_MENTIONS` | no | `wikibot,kb,knowledge-bot` | Comma-separated trigger usernames |
-| `CONFIRMATION_CONFIDENCE_THRESHOLD` | no | `0.85` | AI confidence above which saves skip confirmation |
-| `CONFIRMATION_TTL_MINUTES` | no | `10` | Minutes before unconfirmed saves expire |
-| `CLEANUP_INTERVAL_MINUTES` | no | `5` | Cleanup interval for expired confirmations |
+| `CHUNK_MAX_CHARS` | no | `1800` | Target chunk size; longer sections are split on paragraph boundaries |
+| `CHUNK_OVERLAP_CHARS` | no | `200` | Text repeated between consecutive chunks of a split section |
+| `SEARCH_TOP_K` | no | `8` | Chunks passed to the LLM per answer |
+| `SEARCH_MAX_CHUNKS_PER_DOC` | no | `4` | Max chunks from a single document per answer |
+| `SEARCH_RELATIVE_MARGIN` | no | `0.15` | Semantic matches scoring more than this below the best one are dropped (embedding scores are compressed: unrelated text often scores 0.35–0.45 with bge-m3) |
+| `SEARCH_KEYWORD_MIN_COVERAGE` | no | `0.4` | A keyword-only match must contain this share of the query's distinctive terms, weighted by rarity — one generic word ("documenti") is not enough |
+| `SEARCH_GLOSSARY` | no | — | Acronyms/synonyms, e.g. `AHRW=Ad hoc Revolution Web; G1=Gestionale 1\|Gestionale uno`. When a question uses one form, the others are searched too. Also editable from chat |
+| `SEARCH_DECOMPOSE` | no | `true` | Before searching, the LLM splits a multi-part question ("gestione documenti in Gestionale 1 e in AHRW?") into 2–3 self-contained queries, each searched separately and merged, and rewrites short follow-ups ("e per gli acquisti?") into complete questions using the thread. Only called when the question contains a joining word (e, o, rispetto, differenze…) or is a follow-up; on failure a single search is used |
+| `SEARCH_RERANK` | no | `true` | The LLM reads the best `SEARCH_RERANK_CANDIDATES` passages and keeps only those rated ≥ `SEARCH_RERANK_MIN_SCORE` (3 answers, 2 useful, 1 marginal, 0 unrelated). One short extra LLM call per question; on failure the hybrid order is used |
+| `SEARCH_RERANK_CANDIDATES` | no | `20` | Passages sent to the re-ranker. With a local reranker on CPU each passage costs time: measure before raising it |
+| `RERANK_MAX_CHARS` | no | `1500` | Characters of each passage sent to a reranker model (`api`); lower is much faster on CPU |
+| `SEARCH_RERANK_MIN_SCORE` | no | `2` | Minimum re-ranker score to reach the answer |
+| `SEARCH_RERANK_PROVIDER` | no | `llm` | `llm`: the chat model rates passages 0–3. `api`: a dedicated reranker model (cross-encoder such as Qwen3-Reranker or bge-reranker-v2-m3) scores them 0–1 via a `/rerank` endpoint — cheaper and faster, no text generated |
+| `RERANK_BASE_URL` | for `api` | — | `https://openrouter.ai/api/v1`, a llama.cpp server started with `--reranking` (`http://reranker:8080/v1`), or Hugging Face TEI (`http://reranker:80`) |
+| `RERANK_MODEL` | for OpenRouter | — | e.g. `qwen/qwen3-reranker-8b` |
+| `RERANK_API_KEY` | no | `LLM_API_KEY` | Bearer token for the reranker endpoint |
+| `RERANK_API_FORMAT` | no | `cohere` | `cohere` (`{query, documents}` → `{results:[{index, relevance_score}]}`: OpenRouter, llama.cpp, Jina, Cohere) or `tei` |
+| `RERANK_PROVIDER_PREFS` | no | — | OpenRouter provider routing for rerank calls, e.g. `{"zdr":true,"data_collection":"deny"}` |
+| `RERANK_MIN_SCORE` | no | `0.3` | Reranker score (0–1) a passage needs; tune it with `@wikibot debug <question>` |
+| `EMBEDDING_QUERY_PREFIX` | no | — | Instruction prepended to queries only (Qwen3-Embedding needs one; `
+` = newline). Changing it does not require re-indexing |
+
+### Questions
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `GENERAL_QA_ENABLED` | no | `true` | Allow answers that don't come from the wiki (`chiedi`, and fallback for free-text questions) |
+| `SEARCH_SCORE_THRESHOLD` | no | `0.3` | Minimum similarity for a chunk to count as relevant |
+
+### Saving (human-in-the-loop)
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `SAVE_APPROVAL_MODE` | no | `always` | `always`: every change needs approval. `auto_high_conf`: changes with confidence ≥ threshold that don't replace existing content are applied directly |
+| `CONFIRMATION_CONFIDENCE_THRESHOLD` | no | `0.85` | Threshold for `auto_high_conf` |
+| `SAVE_APPROVERS` | no | — | Usernames who may approve anyone's proposals (the requester always can) |
+| `SAVE_CHANGELOG_HEADING` | no | `Storico aggiornamenti` | Section where the audit line is appended in each touched document; empty disables it |
+| `CONFIRMATION_TTL_MINUTES` | no | `60` | Minutes before an unanswered proposal expires |
+| `CLEANUP_INTERVAL_MINUTES` | no | `5` | How often expired proposals are swept |
 
 ### HTTP API / Widget
 
@@ -99,18 +195,18 @@ Copy `.env.example` to `.env` and fill in required values.
 ## Local development
 
 ```bash
-npm install
+npm ci           # Node 26+; install scripts follow "allowScripts" in package.json
 cp .env.example .env
-# fill in .env
+# fill in .env (loaded with Node's built-in process.loadEnvFile)
 npm run dev        # hot-reload via tsx watch
-npm test           # unit tests
+npm test           # unit + integration tests (no network)
 npm run typecheck  # TypeScript strict check
 ```
 
 ## Production deployment
 
 ```bash
-git clone https://github.com/danyeah/mattermost-knowledge-bot /opt/kb-bot
+git clone https://github.com/manudarp/mattermost-knowledge-bot /opt/kb-bot
 cd /opt/kb-bot
 cp .env.example .env
 # populate the required vars in .env
@@ -123,17 +219,18 @@ docker compose logs -f
 Expected startup log sequence:
 ```
 db_ready
+pinned_collections_resolved   (when OUTLINE_COLLECTIONS is set)
 primary_team_resolved
-api_server_started
 confirmation_cleanup_started
 embedding_model_ready        (or embedding_model_not_ready_search_disabled)
+api_server_started
 ws_connected
 ws_authenticated
 outline_index_sync_start
 outline_index_sync_done
 ```
 
-To update: `git pull && docker compose up -d --build`
+To update: `git pull && docker compose up -d --build`. Database migrations run automatically; existing channels keep their collection, which becomes the first linked collection.
 
 ### Network topology
 
@@ -143,31 +240,65 @@ The Docker Compose file joins an external `pm-network` and includes an Ollama si
 [VPS: kb-bot + ollama]  ──Tailscale──▶  [GPU server: llama.cpp :8020]
 ```
 
-Optionally put **llm-proxy** in front of llama.cpp to get request logging and a monitoring dashboard.
-
 ## How to use
 
-### Save a thread to Outline
+In channels, mention the bot. In a direct message with the bot, no mention is needed.
 
-In any Mattermost thread reply, mention the bot:
-```
-@wikibot
-```
-The bot detects the topic automatically. If confidence is below the threshold, it asks for confirmation — react with 👍 or reply with `#different-topic`.
-
-Override topic detection explicitly:
-```
-@wikibot #authentication
-```
-
-### Semantic search from Mattermost
+### Ask questions
 
 ```
-@wikibot cerca come funziona il processo di onboarding?
+@wikibot qual è lo stato del progetto ACME?      # wiki when relevant, otherwise general knowledge
+@wikibot cerca procedura di onboarding           # wiki only, with sources
+@wikibot chiedi come si scrive una regex per le email   # general AI, the wiki is not consulted
 ```
-The bot searches documents saved for that channel via RAG, generates an answer with Qwen, and replies with cited sources. If no relevant documents are found, it says so.
 
-### Semantic search from Outline (widget)
+Answers based on the wiki cite their sources; general answers are labelled as such. Inside a thread, the previous messages are passed as context, so follow-up questions work.
+
+### Save knowledge to Outline
+
+Inside a thread reply:
+
+```
+@wikibot salva
+@wikibot salva aggiorna la fase 2 del progetto ACME per il cliente Globex
+```
+
+The bot replies with a proposal such as:
+
+> 📝 **Proposta di modifica alla knowledge base** · #12
+> **Azione:** ✏️ aggiornare *Globex — ACME — Fase 2*
+> **Percorso:** Clienti › Globex › ACME › Globex — ACME — Fase 2
+> **Confidenza:** 88% — Il thread riporta il completamento del collaudo della fase 2…
+> **Modifiche proposte:** ✏️ Sostituisce «Stato» … ➕ Aggiunge a «Attività» …
+
+Then, as the requester (or an approver):
+
+| Reply / reaction | Effect |
+|---|---|
+| 👍 ✅ or `ok` / `conferma` | apply the change |
+| 👎 ❌ or `annulla` | discard it |
+| `doc: <link or title>` | update that document instead (content is regenerated) |
+| `collezione: <name>` | create a new document in that collection instead |
+| `sotto: <link or title>` | create a new document nested under that document |
+| `titolo: <title>` | change the title of the new document |
+| `nota: <instructions>` | regenerate the proposal following the instructions |
+
+Attachments are uploaded to the target document on approval and linked in the audit line. Attachments whose text can't be extracted (scanned PDFs, images) are flagged in the proposal.
+
+### Managing collections
+
+```
+@wikibot collezioni                              # collections used in this channel (env / global / channel)
+@wikibot collezioni disponibili                  # every collection the Outline token can see
+@wikibot collezioni aggiungi Clienti, Procedure  # link to this channel (names, URLs or IDs)
+@wikibot collezioni rimuovi Procedure            # unlink from this channel (Outline is untouched)
+@wikibot collezioni aggiungi globale Handbook    # link for all channels (BOT_ADMINS)
+@wikibot collezioni crea Nuovi clienti           # create in Outline and link (BOT_ADMINS)
+```
+
+A channel uses the union of: collections pinned in `OUTLINE_COLLECTIONS`, global links and its own links. If a channel has no collection at all, questions search the whole indexed wiki and saves are refused until a collection is linked.
+
+### Outline widget
 
 The widget is a floating chat bubble that appears on every Outline page. Embed it by injecting the script via your Outline reverse proxy:
 
@@ -186,31 +317,86 @@ The widget automatically scopes search to the current context:
 - On a `/collection/*` page → searches only that collection first, falls back to full wiki
 - On any other page → searches the full wiki
 
-If the LLM is busy, the widget shows "In coda... (N prima di te)" updated every 2 seconds.
-
 ### Other commands
 
 ```
 @wikibot help    # usage instructions
-@wikibot status  # channel wiki status and Outline link
+@wikibot status  # linked collections, pending proposals, last save, index size, LLM in use
 ```
+
+### Search index
+
+```
+@wikibot indicizza                  # index new/changed documents now; reports in the thread when done
+@wikibot indicizza <document link>  # index one document now and check it is searchable from this channel
+@wikibot indicizza stato            # indexed documents, running sync, last result and failures
+@wikibot indicizza tutto            # rebuild the whole index, re-embedding everything (BOT_ADMINS, slow)
+```
+
+### Glossary and search debugging
+
+```
+@wikibot glossario                                        # list acronyms/synonyms
+@wikibot glossario aggiungi AHRW = Ad hoc Revolution Web  # BOT_ADMINS; alternatives with |
+@wikibot glossario rimuovi AHRW
+@wikibot debug come funziona la gestione documenti in AHRW?   # which passages the search found, scores, why each was kept or dropped
+```
+
+`indicizza <link>` also explains why a document can't be found: the bot's Outline user can't read it, it's a draft (drafts are not synced), it has no text, or its collection isn't linked to the channel.
+
+### Local reranker (and embeddings) with Infinity
+
+[Infinity](https://github.com/michaelfeil/infinity) is an open-source server that runs embedding and reranker models side by side in one container, exposing an OpenAI-compatible `/embeddings` and a Cohere-compatible `/rerank` — the two formats the bot speaks. To try a dedicated reranker while keeping Ollama for embeddings:
+
+```yaml
+  infinity:
+    image: michaelf34/infinity:latest-cpu
+    command: v2 --model-id BAAI/bge-reranker-v2-m3 --engine torch --port 7997   # the CPU image defaults to the ONNX engine, which this model lacks
+    volumes:
+      - ./data/infinity:/app/.cache   # downloaded models
+    restart: unless-stopped
+```
+
+```
+SEARCH_RERANK_PROVIDER=api
+RERANK_BASE_URL=http://infinity:7997
+RERANK_MODEL=BAAI/bge-reranker-v2-m3
+```
+
+Switch back with `SEARCH_RERANK_PROVIDER=llm` and compare with `@wikibot debug <question>`. Later, embeddings can move to the same container by adding `--model-id BAAI/bge-m3 --engine torch` and setting `EMBEDDING_PROVIDER=openai`, `EMBEDDING_BASE_URL=http://infinity:7997`, `EMBEDDING_MODEL=BAAI/bge-m3` (this changes the embedding backend, so the index is rebuilt once). Pin a versioned image tag (`x.y.z-cpu`) once it works.
 
 ## RAG pipeline
 
-1. **Indexing** (background, every `INDEX_SYNC_INTERVAL_MINUTES`): fetches all Outline documents, splits into chunks by `##` heading, embeds via bge-m3 (Ollama), stores in SQLite.
-2. **Search**: embeds the query, computes cosine similarity against all stored chunks, returns top-K.
-3. **Generation**: top-K chunks are passed as context to the LLM, which generates an answer in Italian with source citations.
+1. **Indexing** (background, every `INDEX_SYNC_INTERVAL_MINUTES`, and immediately after each applied save): fetches the Outline documents, splits them on **every heading level** into chunks of at most `CHUNK_MAX_CHARS` (long sections split on paragraphs, code blocks kept whole, with overlap), and embeds each chunk together with its title and heading path ("Gestione dati › Sincronizzatore › Servizi SOAP"). Vectors are stored as Float32 BLOBs in SQLite, and the same chunks feed an FTS5 keyword index. Unchanged documents are skipped, moved ones re-tagged, deleted ones dropped. Progress is logged every 25 documents (`outline_index_sync_progress`).
+2. **Search** (hybrid): the query is matched both semantically (cosine similarity on embeddings) and by keywords (BM25), and the two rankings are merged with Reciprocal Rank Fusion. Exact technical terms ("SOAP", "WSDL", table names) are found even when embeddings blur them. If the embedding backend is down, search falls back to keywords only.
+   Then three filters keep marginal passages out: semantic matches must be within `SEARCH_RELATIVE_MARGIN` of the best one; keyword-only matches must cover enough of the question's distinctive terms; finally the LLM re-ranks the survivors and keeps those that actually answer the question (`SEARCH_RERANK`). Acronyms from the glossary are searched in all their forms (the glossary is only for synonyms). Multi-part questions are split into separate searches and follow-ups rewritten with the thread context (`SEARCH_DECOMPOSE`).
+3. **Generation**: the top `SEARCH_TOP_K` chunks (at most `SEARCH_MAX_CHUNKS_PER_DOC` per document) are passed to the LLM, which answers with source citations.
 
 ## Troubleshooting
 
 **Bot doesn't respond**
 Check `ws_authenticated` appears in logs. Verify `MM_URL` and `MM_BOT_TOKEN`.
 
+**"Nessuna collection Outline collegata"**
+Link one with `@wikibot collezioni aggiungi <nome>` or set `OUTLINE_COLLECTIONS`. Check `pinned_collection_not_found` warnings in the logs for typos.
+
 **Search returns no results**
-Check `embedding_model_ready` in startup logs. Verify Ollama is running and `bge-m3` is pulled. If `outline_index_sync_done` shows `indexed: 0`, check `OUTLINE_URL` and `OUTLINE_API_TOKEN`.
+Check `embedding_model_ready` in startup logs. Verify Ollama is running and `bge-m3` is pulled. If `outline_index_sync_done` shows `indexed: 0`, check `OUTLINE_URL` and `OUTLINE_API_TOKEN`. Right after upgrading, documents are re-indexed on the first sync.
+
+**A recent document isn't found**
+Run `@wikibot indicizza <document link>` in the channel where you asked: it indexes the document immediately and tells you what's wrong (no access for the bot's Outline user, draft, empty, collection not linked to the channel). `@wikibot indicizza stato` lists the documents the last sync failed on.
 
 **LLM errors**
-If using local LLM, check `LLM_BASE_URL` is reachable from the bot container. If using Anthropic, verify `ANTHROPIC_API_KEY`.
+For local LLMs, check `LLM_BASE_URL` is reachable from the bot container. For hosted providers, check `LLM_API_KEY` and `LLM_MODEL` (401/404 errors are not retried). If using Anthropic, verify `ANTHROPIC_API_KEY`.
+
+**"il modello ha restituito una risposta vuota"**
+Usually a reasoning model (R1, o-series, Qwen thinking…) that used its whole token budget on reasoning. The bot already retries with a larger budget; if it keeps happening, set `LLM_REASONING_EFFORT=low` (OpenRouter), raise `LLM_MAX_OUTPUT_TOKENS`, or use a non-reasoning model. The log line `ai_*_empty_or_truncated` shows `finish_reason` and the tokens used.
+
+**`429 rate_limit_exceeded` from Outline in the logs**
+Outline's rate limiter is slowing the bot down; the bot waits (honouring `Retry-After`) and retries, and a document that still fails is skipped and retried on the next sync. Unchanged documents are not downloaded at all, so this mostly happens on the first full sync. Raise `OUTLINE_REQUEST_DELAY_MS` (e.g. `1000`) or Outline's own limits (`RATE_LIMITER_REQUESTS`, `RATE_LIMITER_DURATION_WINDOW`). Make sure Outline sees real client IPs through the reverse proxy, otherwise all users share the bot's rate-limit bucket.
+
+**Proposal can't be applied ("il documento è cambiato…")**
+Someone edited or removed a section the proposal targeted. Reply `nota: rigenera` to redraft it against the current version.
 
 **Widget returns 404 on `/kb/search`**
 Your Outline reverse proxy is not forwarding `/kb/` to the bot. Add the `location /kb/` proxy block shown above.
@@ -218,20 +404,19 @@ Your Outline reverse proxy is not forwarding `/kb/` to the bot. Add the `locatio
 **Database issues**
 Ensure `./data` is writable by UID 1000: `chown -R 1000:1000 data`. A `SQLITE_CANTOPEN` error at startup means the directory permissions are wrong.
 
-**Topic saved to wrong document**
-Use `@wikibot #explicit-topic` to override. Renaming the document title in Outline is safe — the bot tracks documents by ID, not title.
-
 ## Testing
 
 ```bash
 npm test
 ```
 
-Unit tests (no network, no `.env` required):
-- `commandParser.test.ts`
-- `slugify.test.ts`
-- `documentBuilder.test.ts`
-- `helpers.test.ts`
+Tests (no network, no `.env` required):
+- `commandParser.test.ts` — commands, collection sub-commands, proposal replies
+- `markdownSections.test.ts` — section-level document edits
+- `outlineRefs.test.ts` — collection/document reference resolution, LLM URL building
+- `migrations.test.ts` — upgrade of a legacy database
+- `smartSave.test.ts` — end-to-end save flow with fake Outline/Mattermost/LLM
+- `slugify.test.ts`, `helpers.test.ts`
 
 ## License
 

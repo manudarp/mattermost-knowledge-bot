@@ -21,6 +21,8 @@ export class HttpError extends Error {
     public readonly status: number,
     public readonly body: string,
     message: string,
+    /** Server-requested wait (Retry-After), in milliseconds. */
+    public readonly retryAfterMs?: number,
   ) {
     super(message);
     this.name = "HttpError";
@@ -50,7 +52,10 @@ export async function retryWithBackoff<T>(fn: () => Promise<T>, opts?: RetryOpts
       if (attempt === retries || !shouldRetry(err)) {
         throw err;
       }
-      const delay = Math.min(baseMs * Math.pow(2, attempt), maxMs);
+      const backoff = Math.min(baseMs * Math.pow(2, attempt), maxMs);
+      // Honour the server's Retry-After when it asks for longer (capped at 2 minutes).
+      const requested = err instanceof HttpError && err.retryAfterMs !== undefined ? Math.min(err.retryAfterMs, 120_000) : 0;
+      const delay = Math.max(backoff, requested);
       logger.warn({ attempt, delay_ms: delay, err }, "retry_backoff");
       await new Promise((resolve) => setTimeout(resolve, delay));
     }

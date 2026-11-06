@@ -26,8 +26,6 @@ function scopeFromPageUrl(pageUrl: string | undefined): SearchScope | undefined 
   return undefined;
 }
 
-const SCORE_THRESHOLD = 0.3;
-
 function cors(res: ServerResponse): void {
   res.setHeader("Access-Control-Allow-Origin", config.API_CORS_ORIGIN);
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
@@ -242,14 +240,15 @@ export function startApiServer(log: Logger): void {
         }
 
         const scope = scopeFromPageUrl(parsed.pageUrl);
-        let chunks = await search(query, 5, scope);
+        // On a document page all chunks may legitimately come from that one document.
+        let chunks = await search(query, config.SEARCH_TOP_K, scope, scope?.docPath ? { maxPerDoc: config.SEARCH_TOP_K } : {});
 
-        // If scoped search returns nothing, fall back to full wiki search
-        if (scope && (chunks.length === 0 || chunks[0]!.score < SCORE_THRESHOLD)) {
-          chunks = await search(query, 5);
+        // If scoped search finds nothing relevant, fall back to full wiki search
+        if (scope && chunks.length === 0) {
+          chunks = await search(query);
         }
 
-        if (!chunks.length || chunks[0]!.score < SCORE_THRESHOLD) {
+        if (chunks.length === 0) {
           json(res, 200, {
             answer: "Non ho trovato documenti rilevanti per questa domanda.",
             sources: [],
