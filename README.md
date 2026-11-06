@@ -350,7 +350,7 @@ The widget automatically scopes search to the current context:
 ```yaml
   infinity:
     image: michaelf34/infinity:latest-cpu
-    command: v2 --model-id BAAI/bge-reranker-v2-m3 --port 7997
+    command: v2 --model-id BAAI/bge-reranker-v2-m3 --engine torch --port 7997   # the CPU image defaults to the ONNX engine, which this model lacks
     volumes:
       - ./data/infinity:/app/.cache   # downloaded models
     restart: unless-stopped
@@ -362,7 +362,7 @@ RERANK_BASE_URL=http://infinity:7997
 RERANK_MODEL=BAAI/bge-reranker-v2-m3
 ```
 
-Switch back with `SEARCH_RERANK_PROVIDER=llm` and compare with `@wikibot debug <question>`. Later, embeddings can move to the same container by adding `--model-id BAAI/bge-m3` and setting `EMBEDDING_PROVIDER=openai`, `EMBEDDING_BASE_URL=http://infinity:7997`, `EMBEDDING_MODEL=BAAI/bge-m3` (this changes the embedding backend, so the index is rebuilt once). Pin a versioned image tag (`x.y.z-cpu`) once it works.
+Switch back with `SEARCH_RERANK_PROVIDER=llm` and compare with `@wikibot debug <question>`. Later, embeddings can move to the same container by adding `--model-id BAAI/bge-m3 --engine torch` and setting `EMBEDDING_PROVIDER=openai`, `EMBEDDING_BASE_URL=http://infinity:7997`, `EMBEDDING_MODEL=BAAI/bge-m3` (this changes the embedding backend, so the index is rebuilt once). Pin a versioned image tag (`x.y.z-cpu`) once it works.
 
 ## RAG pipeline
 
