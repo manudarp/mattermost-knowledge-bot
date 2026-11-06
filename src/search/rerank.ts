@@ -66,7 +66,6 @@ export function rerankUrl(baseUrl: string): string {
   return base.endsWith("/rerank") ? base : `${base}/rerank`;
 }
 
-const API_PASSAGE_CHARS = 1500;
 
 /**
  * Dedicated reranker (cross-encoder such as Qwen3-Reranker or bge-reranker):
@@ -86,7 +85,7 @@ async function rerankWithApi(opts: RerankInput): Promise<number[]> {
   const documents = opts.passages.map((p) => {
     const text = `${p.title}${p.heading && p.heading !== p.title ? ` › ${p.heading}` : ""}
 ${p.content}`;
-    return text.length > API_PASSAGE_CHARS ? text.slice(0, API_PASSAGE_CHARS) : text;
+    return text.length > config.RERANK_MAX_CHARS ? text.slice(0, config.RERANK_MAX_CHARS) : text;
   });
   const body =
     config.RERANK_API_FORMAT === "tei"

@@ -161,12 +161,9 @@ const ConfigSchema = z.object({
   // queries (searched separately) and completes short follow-ups from the thread.
   // Only called when the question looks multi-part or is a follow-up.
   SEARCH_DECOMPOSE: boolFlag(true),
-  // Passages sent to the re-ranker. Empty = 20 with the chat model (each costs
-  // tokens), 40 with a dedicated reranker (`api`, cheap per passage).
-  SEARCH_RERANK_CANDIDATES: z.preprocess(
-    (v) => (v === "" ? undefined : v),
-    z.coerce.number().int().min(2).max(60).optional(),
-  ),
+  // Passages sent to the re-ranker. A local reranker on CPU costs roughly
+  // RERANK_MAX_CHARS/1500 × 1–4 s per passage: keep this low on slow machines.
+  SEARCH_RERANK_CANDIDATES: z.coerce.number().int().min(2).max(60).default(20),
   // 3 = answers the question, 2 = useful, 1 = marginal / special case, 0 = unrelated.
   SEARCH_RERANK_MIN_SCORE: z.coerce.number().int().min(1).max(3).default(2),
   //  llm → the chat model (LLM_*) rates the passages
@@ -198,6 +195,9 @@ const ConfigSchema = z.object({
   // Reranker relevance (0–1) a passage needs to reach the answer. Tune it with `@bot debug`.
   RERANK_MIN_SCORE: z.coerce.number().min(0).max(1).default(0.3),
   RERANK_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+  // Characters of each passage sent to a reranker model. The cost of a
+  // cross-encoder grows with the text: shorter is much faster on CPU.
+  RERANK_MAX_CHARS: z.coerce.number().int().min(200).max(8000).default(1500),
 
   BOT_TRIGGER_MENTIONS: z
     .string()

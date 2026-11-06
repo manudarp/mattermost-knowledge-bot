@@ -435,7 +435,7 @@ export async function searchWithTrace(
   };
 
   // Merge the sub-searches round-robin so every product gets its share.
-  const rerankCandidates = config.SEARCH_RERANK_CANDIDATES ?? (config.SEARCH_RERANK_PROVIDER === "api" ? 40 : 20);
+  const rerankCandidates = config.SEARCH_RERANK_CANDIDATES;
   const limit = rerank ? Math.max(topK, rerankCandidates) : topK;
   const perDoc = new Map<string, number>();
   const taken = new Set<number>();
