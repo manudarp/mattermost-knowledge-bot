@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeAll } from "vitest";
 
 // The LLM re-ranker has its own tests (searchQuality.test.ts).
 process.env.SEARCH_RERANK = "false";
+process.env.SEARCH_DECOMPOSE = "false";
 
 // Deterministic fake embedding: one dimension per topic word. "soap" is
 // deliberately NOT a dimension, so only the keyword index can find it —

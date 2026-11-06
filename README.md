@@ -145,6 +145,7 @@ LLM_NO_THINK_HINT=false
 | `SEARCH_RELATIVE_MARGIN` | no | `0.15` | Semantic matches scoring more than this below the best one are dropped (embedding scores are compressed: unrelated text often scores 0.35–0.45 with bge-m3) |
 | `SEARCH_KEYWORD_MIN_COVERAGE` | no | `0.4` | A keyword-only match must contain this share of the query's distinctive terms, weighted by rarity — one generic word ("documenti") is not enough |
 | `SEARCH_GLOSSARY` | no | — | Acronyms/synonyms, e.g. `AHRW=Ad hoc Revolution Web; G1=Gestionale 1\|Gestionale uno`. When a question uses one form, the others are searched too. Also editable from chat |
+| `SEARCH_DECOMPOSE` | no | `true` | Before searching, the LLM splits a multi-part question ("gestione documenti in Gestionale 1 e in AHRW?") into 2–3 self-contained queries, each searched separately and merged, and rewrites short follow-ups ("e per gli acquisti?") into complete questions using the thread. Only called when the question contains a joining word (e, o, rispetto, differenze…) or is a follow-up; on failure a single search is used |
 | `SEARCH_RERANK` | no | `true` | The LLM reads the best `SEARCH_RERANK_CANDIDATES` passages and keeps only those rated ≥ `SEARCH_RERANK_MIN_SCORE` (3 answers, 2 useful, 1 marginal, 0 unrelated). One short extra LLM call per question; on failure the hybrid order is used |
 | `SEARCH_RERANK_CANDIDATES` | no | `20` | Passages sent to the re-ranker |
 | `SEARCH_RERANK_MIN_SCORE` | no | `2` | Minimum re-ranker score to reach the answer |
@@ -342,11 +343,32 @@ The widget automatically scopes search to the current context:
 
 `indicizza <link>` also explains why a document can't be found: the bot's Outline user can't read it, it's a draft (drafts are not synced), it has no text, or its collection isn't linked to the channel.
 
+### Local reranker (and embeddings) with Infinity
+
+[Infinity](https://github.com/michaelfeil/infinity) is an open-source server that runs embedding and reranker models side by side in one container, exposing an OpenAI-compatible `/embeddings` and a Cohere-compatible `/rerank` — the two formats the bot speaks. To try a dedicated reranker while keeping Ollama for embeddings:
+
+```yaml
+  infinity:
+    image: michaelf34/infinity:latest-cpu
+    command: v2 --model-id BAAI/bge-reranker-v2-m3 --port 7997
+    volumes:
+      - ./data/infinity:/app/.cache   # downloaded models
+    restart: unless-stopped
+```
+
+```
+SEARCH_RERANK_PROVIDER=api
+RERANK_BASE_URL=http://infinity:7997
+RERANK_MODEL=BAAI/bge-reranker-v2-m3
+```
+
+Switch back with `SEARCH_RERANK_PROVIDER=llm` and compare with `@wikibot debug <question>`. Later, embeddings can move to the same container by adding `--model-id BAAI/bge-m3` and setting `EMBEDDING_PROVIDER=openai`, `EMBEDDING_BASE_URL=http://infinity:7997`, `EMBEDDING_MODEL=BAAI/bge-m3` (this changes the embedding backend, so the index is rebuilt once). Pin a versioned image tag (`x.y.z-cpu`) once it works.
+
 ## RAG pipeline
 
 1. **Indexing** (background, every `INDEX_SYNC_INTERVAL_MINUTES`, and immediately after each applied save): fetches the Outline documents, splits them on **every heading level** into chunks of at most `CHUNK_MAX_CHARS` (long sections split on paragraphs, code blocks kept whole, with overlap), and embeds each chunk together with its title and heading path ("Gestione dati › Sincronizzatore › Servizi SOAP"). Vectors are stored as Float32 BLOBs in SQLite, and the same chunks feed an FTS5 keyword index. Unchanged documents are skipped, moved ones re-tagged, deleted ones dropped. Progress is logged every 25 documents (`outline_index_sync_progress`).
 2. **Search** (hybrid): the query is matched both semantically (cosine similarity on embeddings) and by keywords (BM25), and the two rankings are merged with Reciprocal Rank Fusion. Exact technical terms ("SOAP", "WSDL", table names) are found even when embeddings blur them. If the embedding backend is down, search falls back to keywords only.
-   Then three filters keep marginal passages out: semantic matches must be within `SEARCH_RELATIVE_MARGIN` of the best one; keyword-only matches must cover enough of the question's distinctive terms; finally the LLM re-ranks the survivors and keeps those that actually answer the question (`SEARCH_RERANK`). Acronyms from the glossary are searched in all their forms, and short follow-up questions in a thread are searched together with the previous question.
+   Then three filters keep marginal passages out: semantic matches must be within `SEARCH_RELATIVE_MARGIN` of the best one; keyword-only matches must cover enough of the question's distinctive terms; finally the LLM re-ranks the survivors and keeps those that actually answer the question (`SEARCH_RERANK`). Acronyms from the glossary are searched in all their forms (the glossary is only for synonyms). Multi-part questions are split into separate searches and follow-ups rewritten with the thread context (`SEARCH_DECOMPOSE`).
 3. **Generation**: the top `SEARCH_TOP_K` chunks (at most `SEARCH_MAX_CHUNKS_PER_DOC` per document) are passed to the LLM, which answers with source citations.
 
 ## Troubleshooting

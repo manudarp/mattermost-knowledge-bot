@@ -20,19 +20,30 @@ vi.mock("../../src/embedding/client.js", () => ({
   }),
 }));
 
-// Fake re-ranker: rates the general page 3 and everything else 1 (marginal).
+// Fake LLM. Decomposition: echoes the question unless `decomposeReply` is set.
+// Re-ranker: rates the general page 3 and everything else 1 (marginal).
 let rerankBroken = false;
+let decomposeBroken = false;
+let decomposeReply: string[] | null = null;
 const prompts: string[] = [];
+const decomposePrompts: string[] = [];
+const llmReply = (text: string) => ({ text, usage: { input: 0, output: 0 }, finishReason: "stop", truncated: false, reasoned: false });
 vi.mock("../../src/ai/client.js", () => ({
   noThinkHint: () => "",
-  callModel: vi.fn(async ({ userPrompt }: { userPrompt: string }) => {
+  callModel: vi.fn(async ({ systemPrompt, userPrompt }: { systemPrompt: string; userPrompt: string }) => {
+    if (systemPrompt.includes("query di ricerca")) {
+      decomposePrompts.push(userPrompt);
+      if (decomposeBroken) throw new Error("provider down");
+      const question = /^Domanda: (.*)$/m.exec(userPrompt)?.[1] ?? "";
+      return llmReply(JSON.stringify({ queries: decomposeReply ?? [question] }));
+    }
     prompts.push(userPrompt);
     if (rerankBroken) throw new Error("provider down");
     const scores = [...userPrompt.matchAll(/^\[(\d+)\] (.*)$/gm)].map((m) => ({
       id: Number(m[1]),
       score: m[2]!.includes("Gestione documenti") ? 3 : 1,
     }));
-    return { text: JSON.stringify({ scores }), usage: { input: 0, output: 0 }, finishReason: "stop", truncated: false, reasoned: false };
+    return llmReply(JSON.stringify({ scores }));
   }),
 }));
 
@@ -80,7 +91,10 @@ beforeAll(async () => {
 beforeEach(() => {
   embeddingDown = false;
   rerankBroken = false;
+  decomposeBroken = false;
+  decomposeReply = null;
   prompts.length = 0;
+  decomposePrompts.length = 0;
 });
 
 describe("glossary", () => {
@@ -146,7 +160,36 @@ describe("several glossary entries", () => {
     db.prepare("DELETE FROM bot_settings WHERE key = 'search_glossary'").run();
   });
 
-  it("searches each product separately when a question names several", async () => {
+  it("glossary entries alone never split a search", async () => {
+    addGlossaryEntry(["G1", "Gestionale 1"]);
+    try {
+      const { trace } = await searchWithTrace("come funziona la gestione documenti su Gestionale 1 e su AHRW?", 8, undefined, {
+        rerank: false,
+        decompose: false,
+      });
+      expect(trace.passes).toHaveLength(1);
+      expect(trace.passes[0]!.query).toBe("come funziona la gestione documenti su Gestionale 1 e su AHRW?");
+    } finally {
+      removeGlossaryEntry("G1");
+    }
+  });
+});
+
+describe("query decomposition", () => {
+  it("only calls the LLM for questions that look multi-part or are follow-ups", async () => {
+    const { shouldDecompose } = await import("../../src/search/decompose.js");
+    expect(shouldDecompose("come funziona la gestione documenti su Gestionale 1 e su AHRW?", false)).toBe(true);
+    expect(shouldDecompose("differenze tra ferie e permessi retribuiti", false)).toBe(true);
+    expect(shouldDecompose("come si configura la numerazione dei documenti di vendita", false)).toBe(false);
+    expect(shouldDecompose("ferie?", false)).toBe(false);
+    expect(shouldDecompose("e per gli acquisti?", true)).toBe(true);
+
+    const { trace } = await searchWithTrace("come si configura la numerazione dei documenti di vendita", 8, undefined, { rerank: false });
+    expect(trace.decomposition).toBe("skipped");
+    expect(decomposePrompts).toEqual([]);
+  });
+
+  it("searches each part of a multi-part question separately and merges the results", async () => {
     await indexDocument(
       client,
       "doc-g1",
@@ -156,28 +199,35 @@ describe("several glossary entries", () => {
       "/doc/g1",
       "col",
     );
-    addGlossaryEntry(["G1", "Gestionale 1"]);
-    try {
-      const { chunks, trace } = await searchWithTrace("come funziona la gestione documenti su Gestionale 1 e su AHRW?", 8, undefined, {
-        rerank: false,
-      });
-      expect(trace.passes.map((p) => p.label)).toEqual(["AHRW", "G1"]);
-      // Each sub-search leaves the other product out.
-      expect(trace.passes[0]!.query).not.toMatch(/gestionale 1/i);
-      expect(trace.passes[1]!.query).not.toMatch(/ahrw/i);
-      const docs = chunks.map((c) => c.docId);
-      expect(docs).toContain("doc-general");
-      expect(docs).toContain("doc-g1");
-      expect(trace.candidates.find((c) => c.docTitle === "Vendite")?.via).toBe("G1");
+    decomposeReply = ["gestione documenti di vendita in Gestionale 1", "gestione documenti in Ad hoc Revolution Web"];
+    const { chunks, trace } = await searchWithTrace("come funziona la gestione documenti su Gestionale 1 e su AHRW?", 8, undefined, {
+      rerank: false,
+    });
+    expect(trace.decomposition).toBe("split");
+    expect(trace.passes.map((p) => [p.label, p.query])).toEqual([
+      ["#1", "gestione documenti di vendita in Gestionale 1"],
+      ["#2", "gestione documenti in Ad hoc Revolution Web"],
+    ]);
+    const docs = chunks.map((c) => c.docId);
+    expect(docs).toContain("doc-general");
+    expect(docs).toContain("doc-g1");
+    expect(trace.candidates.find((c) => c.docTitle === "Vendite")?.via).toBe("#1");
 
-      const { renderTrace } = await import("../../src/core/searchCommands.js");
-      const text = renderTrace(trace, "tutta la wiki");
-      expect(text).toContain("2 ricerche separate");
-      expect(text).toContain("**Ricerca per G1**");
-      expect(text).toMatch(/\| Vendite › Documenti di vendita \| G1 \|/);
-    } finally {
-      removeGlossaryEntry("G1");
-    }
+    const { renderTrace } = await import("../../src/core/searchCommands.js");
+    const text = renderTrace(trace, "tutta la wiki");
+    expect(text).toContain("2 ricerche separate");
+    expect(text).toContain("**Ricerca #1:** _gestione documenti di vendita in Gestionale 1_");
+    expect(text).toMatch(/\| Vendite › Documenti di vendita \| #1 \|/);
+  });
+
+  it("falls back to a single search when the decomposition fails", async () => {
+    decomposeBroken = true;
+    const { chunks, trace } = await searchWithTrace("come funziona la gestione documenti su Gestionale 1 e su AHRW?", 8, undefined, {
+      rerank: false,
+    });
+    expect(trace.decomposition).toBe("failed");
+    expect(trace.passes).toHaveLength(1);
+    expect(chunks.length).toBeGreaterThan(0);
   });
 });
 
@@ -201,18 +251,31 @@ describe("LLM re-ranking", () => {
     expect(prompts[0]).toContain("AHRW = Ad hoc Revolution Web");
   });
 
-  it("searches short follow-ups together with the previous question", async () => {
+  it("searches short follow-ups together with the previous question when decomposition is off", async () => {
     // Alone, "e per gli acquisti?" matches nothing.
-    expect(await search("e per gli acquisti?", 8, undefined, { rerank: false })).toEqual([]);
+    expect(await search("e per gli acquisti?", 8, undefined, { rerank: false, decompose: false })).toEqual([]);
 
     const chunks = await search("e per gli acquisti?", 8, undefined, {
       conversationHint: "@anna: come funzionano i documenti in AHRW?",
       followUpOf: "come funzionano i documenti in AHRW?",
+      decompose: false,
     });
     expect(chunks.map((c) => c.docId)).toEqual(["doc-general"]);
     // The re-ranker judges the real question, with the conversation as context.
     expect(prompts[0]).toContain("Domanda: e per gli acquisti?");
     expect(prompts[0]).toContain("@anna: come funzionano i documenti in AHRW?");
+  });
+
+  it("rewrites a follow-up into a complete question with the conversation", async () => {
+    decomposeReply = ["come funzionano i documenti di acquisto in AHRW?"];
+    const { chunks, trace } = await searchWithTrace("e per gli acquisti?", 8, undefined, {
+      conversationHint: "@anna: come funzionano i documenti in AHRW?",
+      followUpOf: "come funzionano i documenti in AHRW?",
+    });
+    expect(decomposePrompts[0]).toContain("@anna: come funzionano i documenti in AHRW?");
+    expect(trace.decomposition).toBe("single");
+    expect(trace.passes.map((p) => p.query)).toEqual(["come funzionano i documenti di acquisto in AHRW?"]);
+    expect(chunks.map((c) => c.docId)).toEqual(["doc-general"]);
   });
 
   it("only treats short questions as follow-ups", async () => {

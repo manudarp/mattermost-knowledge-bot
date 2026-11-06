@@ -157,6 +157,10 @@ const ConfigSchema = z.object({
   // The LLM picks, among the best candidates, the passages that really answer
   // the question (one extra short call per question).
   SEARCH_RERANK: boolFlag(true),
+  // Before searching, the LLM splits multi-part questions into 2–3 self-contained
+  // queries (searched separately) and completes short follow-ups from the thread.
+  // Only called when the question looks multi-part or is a follow-up.
+  SEARCH_DECOMPOSE: boolFlag(true),
   SEARCH_RERANK_CANDIDATES: z.coerce.number().int().min(2).max(40).default(20),
   // 3 = answers the question, 2 = useful, 1 = marginal / special case, 0 = unrelated.
   SEARCH_RERANK_MIN_SCORE: z.coerce.number().int().min(1).max(3).default(2),

@@ -5,6 +5,7 @@ import { embedQuery } from "../embedding/client.js";
 import { blobToVector, cosine } from "./vectors.js";
 import { containsPhrase, expandQuery, normalize, type GlossaryEntry } from "./glossary.js";
 import { rerankPassages, rerankThreshold } from "./rerank.js";
+import { decomposeQuery, shouldDecompose } from "./decompose.js";
 
 /**
  * Hybrid retrieval: semantic similarity (embeddings) + keyword match (SQLite
@@ -276,6 +277,8 @@ export interface SearchOptions {
    * has too few words to search on its own, so it is searched together with it.
    */
   followUpOf?: string;
+  /** Split multi-part questions / rewrite follow-ups with the LLM first (default SEARCH_DECOMPOSE). */
+  decompose?: boolean;
 }
 
 export interface TraceCandidate {
@@ -289,12 +292,12 @@ export interface TraceCandidate {
   passed: boolean;
   rerankScore: number | null;
   selected: boolean;
-  /** Sub-search that found it, when the question was split per product. */
+  /** Sub-query that found it ("#1", "#2"…), when the question was split. */
   via: string | null;
 }
 
 export interface TracePass {
-  /** Glossary entry this sub-search focused on, null for a plain search. */
+  /** "#1", "#2"… when the question was split into sub-queries, null otherwise. */
   label: string | null;
   query: string;
   embeddingQuery: string;
@@ -308,6 +311,9 @@ export interface SearchTrace {
   glossaryNote: string;
   semantic: boolean;
   minScore: number;
+  /** split = searched as several sub-queries; single = one query; skipped = not worth an LLM call. */
+  decomposition: "off" | "skipped" | "single" | "split" | "failed";
+  decompositionError: string | null;
   passes: TracePass[];
   candidates: TraceCandidate[];
   rerank: "off" | "ok" | "failed";
@@ -315,21 +321,6 @@ export interface SearchTrace {
 }
 
 const MAX_TRACE = 25;
-/** Questions naming more glossary entries than this are searched as a whole. */
-const MAX_SPLIT = 3;
-
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/** Removes every alias of `entries` from `text` (whole words, case-insensitive). */
-export function withoutEntries(text: string, entries: GlossaryEntry[]): string {
-  let out = text;
-  for (const alias of entries.flatMap((e) => e.aliases)) {
-    out = out.replace(new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegex(alias)}(?![\\p{L}\\p{N}])`, "giu"), " ");
-  }
-  return out.replace(/\s+/g, " ").trim();
-}
 
 interface Evaluated {
   e: Ranked;
@@ -361,16 +352,35 @@ export async function searchWithTrace(
   const maxPerDoc = opts.maxPerDoc ?? config.SEARCH_MAX_CHUNKS_PER_DOC;
   const rerank = opts.rerank ?? config.SEARCH_RERANK;
   const retrievalQuery = opts.followUpOf ? `${opts.followUpOf}\n${query}` : query;
+  const glossaryNote = expandQuery(`${opts.followUpOf ?? ""}\n${query}`).note;
 
-  // A question about several products ("… in Gestionale 1 e in AHRW?") is
-  // searched once per product: in a single search the product with more
-  // documentation would take every candidate slot.
-  const expansion = expandQuery(retrievalQuery);
-  const entities = expansion.matched;
-  const split = entities.length >= 2 && entities.length <= MAX_SPLIT;
-  const subQueries = split
-    ? entities.map((ent) => ({ label: ent.aliases[0]!, q: withoutEntries(retrievalQuery, entities.filter((x) => x !== ent)) }))
-    : [{ label: null, q: retrievalQuery }];
+  // A multi-part question is split into self-contained sub-queries, each
+  // searched on its own (see decompose.ts); a short follow-up is rewritten
+  // into a complete question.
+  let subQueries: Array<{ label: string | null; q: string }> = [{ label: null, q: retrievalQuery }];
+  let decomposition: SearchTrace["decomposition"] = "off";
+  let decompositionError: string | null = null;
+  const decompose = opts.decompose ?? config.SEARCH_DECOMPOSE;
+  if (decompose && shouldDecompose(query, !!opts.conversationHint)) {
+    try {
+      const queries = await decomposeQuery({ query, conversationHint: opts.conversationHint, glossaryNote });
+      if (queries.length > 1) {
+        subQueries = queries.map((q, i) => ({ label: `#${i + 1}`, q }));
+        decomposition = "split";
+      } else {
+        // A rewritten follow-up replaces "previous question + follow-up";
+        // a single self-contained question is searched as the user wrote it.
+        if (opts.conversationHint && queries[0]) subQueries = [{ label: null, q: queries[0] }];
+        decomposition = "single";
+      }
+    } catch (err) {
+      decomposition = "failed";
+      decompositionError = err instanceof Error ? err.message : String(err);
+      logger.warn({ err }, "search_decompose_failed");
+    }
+  } else if (decompose) {
+    decomposition = "skipped";
+  }
 
   const passes: Array<{ info: TracePass; evaluated: Evaluated[]; semantic: boolean }> = [];
   for (const sq of subQueries) {
@@ -384,10 +394,11 @@ export async function searchWithTrace(
     });
   }
 
-  const glossaryNote = expansion.note;
   const trace: SearchTrace = {
     query,
     glossaryNote,
+    decomposition,
+    decompositionError,
     semantic: passes.some((p) => p.semantic),
     minScore,
     passes: passes.map((p) => p.info),

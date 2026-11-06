@@ -71,9 +71,15 @@ export function renderTrace(trace: SearchTrace, scopeLabel: string): string {
   const out: string[] = [`🔎 **Debug ricerca:** _${trace.query}_`, `Ambito: ${scopeLabel}`];
   if (trace.glossaryNote) out.push(`Glossario applicato: ${trace.glossaryNote}`);
   const split = trace.passes.length > 1;
-  if (split) out.push(`La domanda nomina più prodotti: faccio **${trace.passes.length} ricerche separate** e unisco i risultati.`);
+  if (split) {
+    out.push(`La domanda contiene più richieste: faccio **${trace.passes.length} ricerche separate** e unisco i risultati.`);
+  } else if (trace.decomposition === "single" && trace.passes[0] && trace.passes[0].query !== trace.query) {
+    out.push(`Domanda riscritta usando la conversazione: _${cell(trace.passes[0].query, 200)}_`);
+  } else if (trace.decomposition === "failed") {
+    out.push(`⚠️ Scomposizione della domanda fallita (${cell(trace.decompositionError ?? "", 150)}): faccio una ricerca unica.`);
+  }
   for (const p of trace.passes) {
-    const prefix = split ? `**Ricerca per ${p.label}** (_${cell(p.query, 120)}_) — ` : "";
+    const prefix = split ? `**Ricerca ${p.label}:** _${cell(p.query, 150)}_ — ` : "";
     out.push(`${prefix}Parole chiave cercate: \`${p.fts ?? "nessuna"}\``);
     out.push(
       trace.semantic
