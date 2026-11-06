@@ -11,6 +11,7 @@ import {
   removeGlossaryEntry,
 } from "../search/glossary.js";
 import { searchWithTrace, type SearchTrace } from "../search/retrieval.js";
+import { rerankThreshold } from "../search/rerank.js";
 
 export function glossaryHelp(): string {
   const bot = `@${config.MM_BOT_USERNAME}`;
@@ -74,7 +75,9 @@ export function renderTrace(trace: SearchTrace, scopeLabel: string): string {
   );
   out.push(
     trace.rerank === "ok"
-      ? `Riordino AI: attivo, tengo i passaggi con voto ≥ ${config.SEARCH_RERANK_MIN_SCORE} (3 = risponde, 2 = utile, 1 = marginale, 0 = fuori tema)`
+      ? config.SEARCH_RERANK_PROVIDER === "api"
+        ? `Riordino: reranker \`${config.RERANK_MODEL || config.RERANK_BASE_URL}\`, tengo i passaggi con punteggio ≥ ${rerankThreshold()} (da 0 a 1)`
+        : `Riordino AI: attivo, tengo i passaggi con voto ≥ ${rerankThreshold()} (3 = risponde, 2 = utile, 1 = marginale, 0 = fuori tema)`
       : trace.rerank === "failed"
         ? `Riordino AI: **fallito** (${cell(trace.rerankError ?? "", 150)}), uso l'ordine della ricerca`
         : "Riordino AI: disattivato",
@@ -90,7 +93,7 @@ export function renderTrace(trace: SearchTrace, scopeLabel: string): string {
     const kw = c.keywordRank !== null ? `#${c.keywordRank} (${Math.round(c.coverage * 100)}%)` : "—";
     const title = c.heading && c.heading !== c.docTitle ? `${c.docTitle} › ${c.heading}` : c.docTitle;
     out.push(
-      `| ${c.selected ? "✅" : i + 1} | ${cell(title)} | ${trace.semantic ? fmt(c.score) : "—"} | ${kw} | ${c.passed ? c.verdict : `❌ ${c.verdict}`} | ${c.rerankScore ?? "—"} |`,
+      `| ${c.selected ? "✅" : i + 1} | ${cell(title)} | ${trace.semantic ? fmt(c.score) : "—"} | ${kw} | ${c.passed ? c.verdict : `❌ ${c.verdict}`} | ${c.rerankScore === null ? "—" : Number.isInteger(c.rerankScore) ? c.rerankScore : c.rerankScore.toFixed(2)} |`,
     );
   });
   out.push("", "✅ = passaggi passati alla risposta. _Parole chiave_: posizione e % dei termini della domanda presenti.");

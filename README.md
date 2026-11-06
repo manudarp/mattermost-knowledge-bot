@@ -148,6 +148,13 @@ LLM_NO_THINK_HINT=false
 | `SEARCH_RERANK` | no | `true` | The LLM reads the best `SEARCH_RERANK_CANDIDATES` passages and keeps only those rated ≥ `SEARCH_RERANK_MIN_SCORE` (3 answers, 2 useful, 1 marginal, 0 unrelated). One short extra LLM call per question; on failure the hybrid order is used |
 | `SEARCH_RERANK_CANDIDATES` | no | `20` | Passages sent to the re-ranker |
 | `SEARCH_RERANK_MIN_SCORE` | no | `2` | Minimum re-ranker score to reach the answer |
+| `SEARCH_RERANK_PROVIDER` | no | `llm` | `llm`: the chat model rates passages 0–3. `api`: a dedicated reranker model (cross-encoder such as Qwen3-Reranker or bge-reranker-v2-m3) scores them 0–1 via a `/rerank` endpoint — cheaper and faster, no text generated |
+| `RERANK_BASE_URL` | for `api` | — | `https://openrouter.ai/api/v1`, a llama.cpp server started with `--reranking` (`http://reranker:8080/v1`), or Hugging Face TEI (`http://reranker:80`) |
+| `RERANK_MODEL` | for OpenRouter | — | e.g. `qwen/qwen3-reranker-8b` |
+| `RERANK_API_KEY` | no | `LLM_API_KEY` | Bearer token for the reranker endpoint |
+| `RERANK_API_FORMAT` | no | `cohere` | `cohere` (`{query, documents}` → `{results:[{index, relevance_score}]}`: OpenRouter, llama.cpp, Jina, Cohere) or `tei` |
+| `RERANK_PROVIDER_PREFS` | no | — | OpenRouter provider routing for rerank calls, e.g. `{"zdr":true,"data_collection":"deny"}` |
+| `RERANK_MIN_SCORE` | no | `0.3` | Reranker score (0–1) a passage needs; tune it with `@wikibot debug <question>` |
 | `EMBEDDING_QUERY_PREFIX` | no | — | Instruction prepended to queries only (Qwen3-Embedding needs one; `
 ` = newline). Changing it does not require re-indexing |
 

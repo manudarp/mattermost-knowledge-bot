@@ -4,7 +4,7 @@ import { logger } from "../logger.js";
 import { embedQuery } from "../embedding/client.js";
 import { blobToVector, cosine } from "./vectors.js";
 import { containsPhrase, expandQuery, normalize, type GlossaryEntry } from "./glossary.js";
-import { rerankPassages } from "./rerank.js";
+import { rerankPassages, rerankThreshold } from "./rerank.js";
 
 /**
  * Hybrid retrieval: semantic similarity (embeddings) + keyword match (SQLite
@@ -387,6 +387,7 @@ ${query}` : query;
         query,
         conversationHint: opts.conversationHint,
         glossaryNote: hybrid.glossaryNote,
+        followUpOf: opts.followUpOf,
         passages: candidates.map(({ e }) => ({ title: e.row.doc_title, heading: e.row.heading, content: e.row.content })),
       });
       candidates.forEach((c, i) => {
@@ -394,7 +395,7 @@ ${query}` : query;
       });
       selected = candidates
         .map((c, i) => ({ c, s: scores[i] ?? 0, i }))
-        .filter((x) => x.s >= config.SEARCH_RERANK_MIN_SCORE)
+        .filter((x) => x.s >= rerankThreshold())
         .sort((a, b) => b.s - a.s || a.i - b.i)
         .slice(0, topK)
         .map((x) => x.c);

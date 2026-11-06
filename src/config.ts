@@ -160,6 +160,35 @@ const ConfigSchema = z.object({
   SEARCH_RERANK_CANDIDATES: z.coerce.number().int().min(2).max(40).default(20),
   // 3 = answers the question, 2 = useful, 1 = marginal / special case, 0 = unrelated.
   SEARCH_RERANK_MIN_SCORE: z.coerce.number().int().min(1).max(3).default(2),
+  //  llm → the chat model (LLM_*) rates the passages
+  //  api → a dedicated reranker model via a /rerank endpoint (OpenRouter, llama.cpp, TEI…)
+  SEARCH_RERANK_PROVIDER: z.enum(["llm", "api"]).default("llm"),
+  // e.g. https://openrouter.ai/api/v1 · http://reranker:8080/v1 (llama.cpp) · http://reranker:80 (TEI)
+  RERANK_BASE_URL: z.string().url().optional().or(z.literal("")),
+  RERANK_MODEL: z.string().default(""),
+  // Falls back to LLM_API_KEY when empty. Local servers ignore it.
+  RERANK_API_KEY: z.string().default(""),
+  //  cohere → {model, query, documents, top_n} → {results:[{index, relevance_score}]} (OpenRouter, llama.cpp, Jina, Cohere)
+  //  tei    → {query, texts} → [{index, score}] (Hugging Face text-embeddings-inference)
+  RERANK_API_FORMAT: z.enum(["cohere", "tei"]).default("cohere"),
+  // OpenRouter only: provider routing for rerank requests, e.g. {"zdr":true,"data_collection":"deny"}
+  RERANK_PROVIDER_PREFS: z
+    .string()
+    .default("")
+    .transform((s, ctx) => {
+      if (!s.trim()) return null;
+      try {
+        const parsed: unknown = JSON.parse(s);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+      } catch {
+        /* fall through */
+      }
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "must be a JSON object (OpenRouter `provider` preferences)" });
+      return z.NEVER;
+    }),
+  // Reranker relevance (0–1) a passage needs to reach the answer. Tune it with `@bot debug`.
+  RERANK_MIN_SCORE: z.coerce.number().min(0).max(1).default(0.3),
+  RERANK_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
 
   BOT_TRIGGER_MENTIONS: z
     .string()
