@@ -7,7 +7,7 @@ import { getEffectiveCollections } from "./collectionScope.js";
 import {
   addGlossaryEntry,
   listGlossary,
-  parseGlossaryDefinition,
+  parseGlossaryDefinitions,
   removeGlossaryEntry,
 } from "../search/glossary.js";
 import { searchWithTrace, type SearchTrace } from "../search/retrieval.js";
@@ -17,7 +17,7 @@ export function glossaryHelp(): string {
   const bot = `@${config.MM_BOT_USERNAME}`;
   return `**Glossario (sigle e sinonimi per la ricerca)**
 • \`${bot} glossario\` — elenco
-• \`${bot} glossario aggiungi AHRW = Ad hoc Revolution Web\` — più alternative con \`|\`: \`G1 = Gestionale 1 | Gestionale uno\`
+• \`${bot} glossario aggiungi AHRW = Ad hoc Revolution Web\` — più alternative con \`|\` (\`G1 = Gestionale 1 | Gestionale uno\`); più sigle insieme: \`AHRW = Ad hoc Revolution Web; G1 = Gestionale 1\`
 • \`${bot} glossario rimuovi AHRW\`
 • \`${bot} debug <domanda>\` — mostra quali passaggi trova la ricerca e perché`;
 }
@@ -43,10 +43,13 @@ export function handleGlossaryCommand(opts: { args: string; username: string }):
   }
 
   if (action.action === "add") {
-    const aliases = parseGlossaryDefinition(action.definition);
-    if (!aliases) return "⚠️ Servono almeno due forme diverse, es. `AHRW = Ad hoc Revolution Web`.";
-    const { replaced } = addGlossaryEntry(aliases);
-    return `✅ ${replaced ? "Aggiornato" : "Aggiunto"}: **${aliases[0]}** = ${aliases.slice(1).join(" | ")}`;
+    const definitions = parseGlossaryDefinitions(action.definition);
+    if (definitions.length === 0) return "⚠️ Servono almeno due forme diverse, es. `AHRW = Ad hoc Revolution Web`.";
+    const lines = definitions.map((aliases) => {
+      const { replaced } = addGlossaryEntry(aliases);
+      return `✅ ${replaced ? "Aggiornato" : "Aggiunto"}: **${aliases[0]}** = ${aliases.slice(1).join(" | ")}`;
+    });
+    return lines.join("\n");
   }
 
   const outcome = removeGlossaryEntry(action.term);
@@ -67,12 +70,17 @@ function cell(s: string, max = 70): string {
 export function renderTrace(trace: SearchTrace, scopeLabel: string): string {
   const out: string[] = [`🔎 **Debug ricerca:** _${trace.query}_`, `Ambito: ${scopeLabel}`];
   if (trace.glossaryNote) out.push(`Glossario applicato: ${trace.glossaryNote}`);
-  out.push(`Parole chiave cercate: \`${trace.fts ?? "nessuna"}\``);
-  out.push(
-    trace.semantic
-      ? `Similarità semantica: migliore ${fmt(trace.topScore)} · soglia ${fmt(trace.minScore)} · margine ${fmt(config.SEARCH_RELATIVE_MARGIN)} → passano i passaggi ≥ **${fmt(trace.semanticFloor)}**`
-      : "⚠️ Embedding non disponibile: solo ricerca per parole chiave.",
-  );
+  const split = trace.passes.length > 1;
+  if (split) out.push(`La domanda nomina più prodotti: faccio **${trace.passes.length} ricerche separate** e unisco i risultati.`);
+  for (const p of trace.passes) {
+    const prefix = split ? `**Ricerca per ${p.label}** (_${cell(p.query, 120)}_) — ` : "";
+    out.push(`${prefix}Parole chiave cercate: \`${p.fts ?? "nessuna"}\``);
+    out.push(
+      trace.semantic
+        ? `${split ? "  " : ""}Similarità semantica: migliore ${fmt(p.topScore)} · soglia ${fmt(trace.minScore)} · margine ${fmt(config.SEARCH_RELATIVE_MARGIN)} → passano i passaggi ≥ **${fmt(p.semanticFloor)}**`
+        : "⚠️ Embedding non disponibile: solo ricerca per parole chiave.",
+    );
+  }
   out.push(
     trace.rerank === "ok"
       ? config.SEARCH_RERANK_PROVIDER === "api"
@@ -88,12 +96,17 @@ export function renderTrace(trace: SearchTrace, scopeLabel: string): string {
     return out.join("\n");
   }
 
-  out.push("", "| | Documento › sezione | Sem. | Parole chiave | Esito | AI |", "|---|---|---|---|---|---|");
+  out.push(
+    "",
+    `| | Documento › sezione |${split ? " Ricerca |" : ""} Sem. | Parole chiave | Esito | AI |`,
+    `|---|---|${split ? "---|" : ""}---|---|---|---|`,
+  );
   trace.candidates.forEach((c, i) => {
     const kw = c.keywordRank !== null ? `#${c.keywordRank} (${Math.round(c.coverage * 100)}%)` : "—";
     const title = c.heading && c.heading !== c.docTitle ? `${c.docTitle} › ${c.heading}` : c.docTitle;
+    const ai = c.rerankScore === null ? "—" : Number.isInteger(c.rerankScore) ? String(c.rerankScore) : c.rerankScore.toFixed(2);
     out.push(
-      `| ${c.selected ? "✅" : i + 1} | ${cell(title)} | ${trace.semantic ? fmt(c.score) : "—"} | ${kw} | ${c.passed ? c.verdict : `❌ ${c.verdict}`} | ${c.rerankScore === null ? "—" : Number.isInteger(c.rerankScore) ? c.rerankScore : c.rerankScore.toFixed(2)} |`,
+      `| ${c.selected ? "✅" : i + 1} | ${cell(title)} |${split ? ` ${c.via ?? ""} |` : ""} ${trace.semantic ? fmt(c.score) : "—"} | ${kw} | ${c.passed ? c.verdict : `❌ ${c.verdict}`} | ${ai} |`,
     );
   });
   out.push("", "✅ = passaggi passati alla risposta. _Parole chiave_: posizione e % dei termini della domanda presenti.");

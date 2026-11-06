@@ -289,23 +289,66 @@ export interface TraceCandidate {
   passed: boolean;
   rerankScore: number | null;
   selected: boolean;
+  /** Sub-search that found it, when the question was split per product. */
+  via: string | null;
+}
+
+export interface TracePass {
+  /** Glossary entry this sub-search focused on, null for a plain search. */
+  label: string | null;
+  query: string;
+  embeddingQuery: string;
+  fts: string | null;
+  topScore: number;
+  semanticFloor: number;
 }
 
 export interface SearchTrace {
   query: string;
-  embeddingQuery: string;
   glossaryNote: string;
-  fts: string | null;
   semantic: boolean;
-  topScore: number;
   minScore: number;
-  semanticFloor: number;
+  passes: TracePass[];
   candidates: TraceCandidate[];
   rerank: "off" | "ok" | "failed";
   rerankError: string | null;
 }
 
 const MAX_TRACE = 25;
+/** Questions naming more glossary entries than this are searched as a whole. */
+const MAX_SPLIT = 3;
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Removes every alias of `entries` from `text` (whole words, case-insensitive). */
+export function withoutEntries(text: string, entries: GlossaryEntry[]): string {
+  let out = text;
+  for (const alias of entries.flatMap((e) => e.aliases)) {
+    out = out.replace(new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegex(alias)}(?![\\p{L}\\p{N}])`, "giu"), " ");
+  }
+  return out.replace(/\s+/g, " ").trim();
+}
+
+interface Evaluated {
+  e: Ranked;
+  coverage: number;
+  ok: boolean;
+  verdict: string;
+}
+
+function evaluate(hybrid: HybridResult, semanticFloor: number): Evaluated[] {
+  const weights = conceptWeights(hybrid.concepts);
+  return hybrid.ranked.map((e) => {
+    const coverage = e.keywordRank !== null ? coverageOf(e.row, hybrid.concepts, weights) : 0;
+    const semanticOk = hybrid.semantic && e.score >= semanticFloor;
+    const strongKeyword = e.keywordRank !== null && e.keywordRank <= KEYWORD_RELEVANT_RANK;
+    const keywordOk = strongKeyword && coverage >= config.SEARCH_KEYWORD_MIN_COVERAGE;
+    const verdict = semanticOk ? "semantica" : keywordOk ? "parole chiave" : strongKeyword ? "poche parole della domanda" : "poco simile";
+    return { e, coverage, ok: semanticOk || keywordOk, verdict };
+  });
+}
 
 /** Relevant chunks for a question, best first, with an explanation of every decision. */
 export async function searchWithTrace(
@@ -317,67 +360,91 @@ export async function searchWithTrace(
   const minScore = opts.minScore ?? config.SEARCH_SCORE_THRESHOLD;
   const maxPerDoc = opts.maxPerDoc ?? config.SEARCH_MAX_CHUNKS_PER_DOC;
   const rerank = opts.rerank ?? config.SEARCH_RERANK;
-  const retrievalQuery = opts.followUpOf ? `${opts.followUpOf}
-${query}` : query;
-  const hybrid = await rankHybrid(retrievalQuery, scope);
-  const weights = conceptWeights(hybrid.concepts);
-  const semanticFloor = Math.max(minScore, hybrid.topScore - config.SEARCH_RELATIVE_MARGIN);
+  const retrievalQuery = opts.followUpOf ? `${opts.followUpOf}\n${query}` : query;
 
+  // A question about several products ("… in Gestionale 1 e in AHRW?") is
+  // searched once per product: in a single search the product with more
+  // documentation would take every candidate slot.
+  const expansion = expandQuery(retrievalQuery);
+  const entities = expansion.matched;
+  const split = entities.length >= 2 && entities.length <= MAX_SPLIT;
+  const subQueries = split
+    ? entities.map((ent) => ({ label: ent.aliases[0]!, q: withoutEntries(retrievalQuery, entities.filter((x) => x !== ent)) }))
+    : [{ label: null, q: retrievalQuery }];
+
+  const passes: Array<{ info: TracePass; evaluated: Evaluated[]; semantic: boolean }> = [];
+  for (const sq of subQueries) {
+    // Sequential: a local embedding server handles one request at a time anyway.
+    const hybrid = await rankHybrid(sq.q, scope);
+    const semanticFloor = Math.max(minScore, hybrid.topScore - config.SEARCH_RELATIVE_MARGIN);
+    passes.push({
+      info: { label: sq.label, query: sq.q, embeddingQuery: hybrid.embeddingQuery, fts: hybrid.fts, topScore: hybrid.topScore, semanticFloor },
+      evaluated: evaluate(hybrid, semanticFloor),
+      semantic: hybrid.semantic,
+    });
+  }
+
+  const glossaryNote = expansion.note;
   const trace: SearchTrace = {
     query,
-    embeddingQuery: hybrid.embeddingQuery,
-    glossaryNote: hybrid.glossaryNote,
-    fts: hybrid.fts,
-    semantic: hybrid.semantic,
-    topScore: hybrid.topScore,
+    glossaryNote,
+    semantic: passes.some((p) => p.semantic),
     minScore,
-    semanticFloor,
+    passes: passes.map((p) => p.info),
     candidates: [],
     rerank: "off",
     rerankError: null,
   };
+  const addTrace = (ev: Evaluated, via: string | null, verdict: string, passed: boolean): TraceCandidate | null => {
+    if (trace.candidates.length >= MAX_TRACE) return null;
+    const t: TraceCandidate = {
+      docTitle: ev.e.row.doc_title,
+      heading: ev.e.row.heading,
+      score: ev.e.score,
+      keywordRank: ev.e.keywordRank,
+      coverage: ev.coverage,
+      verdict,
+      passed,
+      rerankScore: null,
+      selected: false,
+      via,
+    };
+    trace.candidates.push(t);
+    return t;
+  };
 
+  // Merge the sub-searches round-robin so every product gets its share.
   const limit = rerank ? Math.max(topK, config.SEARCH_RERANK_CANDIDATES) : topK;
   const perDoc = new Map<string, number>();
+  const taken = new Set<number>();
   const candidates: Array<{ e: Ranked; t: TraceCandidate | null }> = [];
-
-  for (const e of hybrid.ranked) {
-    const coverage = e.keywordRank !== null ? coverageOf(e.row, hybrid.concepts, weights) : 0;
-    const semanticOk = hybrid.semantic && e.score >= semanticFloor;
-    const keywordOk =
-      e.keywordRank !== null && e.keywordRank <= KEYWORD_RELEVANT_RANK && coverage >= config.SEARCH_KEYWORD_MIN_COVERAGE;
-
-    let verdict: string;
-    let passed = false;
-    if (!semanticOk && !keywordOk) {
-      verdict = e.keywordRank !== null && e.keywordRank <= KEYWORD_RELEVANT_RANK ? "poche parole della domanda" : "poco simile";
-    } else if ((perDoc.get(e.row.doc_id) ?? 0) >= maxPerDoc) {
-      verdict = "troppe sezioni dello stesso documento";
-    } else if (candidates.length >= limit) {
-      verdict = "oltre il limite";
-    } else {
-      passed = true;
-      verdict = semanticOk ? "semantica" : "parole chiave";
-      perDoc.set(e.row.doc_id, (perDoc.get(e.row.doc_id) ?? 0) + 1);
+  const queues = passes.map((p) => p.evaluated.filter((ev) => ev.ok));
+  const overflow: Array<{ ev: Evaluated; via: string | null }> = [];
+  while (queues.some((q) => q.length > 0)) {
+    queues.forEach((q, i) => {
+      const ev = q.shift();
+      if (!ev || taken.has(ev.e.row.id)) return;
+      taken.add(ev.e.row.id);
+      const via = passes[i]!.info.label;
+      if (candidates.length >= limit) {
+        overflow.push({ ev, via });
+      } else if ((perDoc.get(ev.e.row.doc_id) ?? 0) >= maxPerDoc) {
+        addTrace(ev, via, "troppe sezioni dello stesso documento", false);
+      } else {
+        perDoc.set(ev.e.row.doc_id, (perDoc.get(ev.e.row.doc_id) ?? 0) + 1);
+        candidates.push({ e: ev.e, t: addTrace(ev, via, ev.verdict, true) });
+      }
+    });
+    if (candidates.length >= limit && overflow.length >= MAX_TRACE) break;
+  }
+  for (const { ev, via } of overflow) addTrace(ev, via, "oltre il limite", false);
+  for (const p of passes) {
+    for (const ev of p.evaluated) {
+      if (!ev.ok && !taken.has(ev.e.row.id)) {
+        taken.add(ev.e.row.id);
+        addTrace(ev, p.info.label, ev.verdict, false);
+      }
     }
-
-    const t: TraceCandidate | null =
-      trace.candidates.length < MAX_TRACE
-        ? {
-            docTitle: e.row.doc_title,
-            heading: e.row.heading,
-            score: e.score,
-            keywordRank: e.keywordRank,
-            coverage,
-            verdict,
-            passed,
-            rerankScore: null,
-            selected: false,
-          }
-        : null;
-    if (t) trace.candidates.push(t);
-    if (passed) candidates.push({ e, t });
-    if (candidates.length >= limit && trace.candidates.length >= MAX_TRACE) break;
   }
 
   let selected = candidates.slice(0, topK);
@@ -386,7 +453,7 @@ ${query}` : query;
       const scores = await rerankPassages({
         query,
         conversationHint: opts.conversationHint,
-        glossaryNote: hybrid.glossaryNote,
+        glossaryNote,
         followUpOf: opts.followUpOf,
         passages: candidates.map(({ e }) => ({ title: e.row.doc_title, heading: e.row.heading, content: e.row.content })),
       });
@@ -409,7 +476,7 @@ ${query}` : query;
   }
 
   for (const c of selected) if (c.t) c.t.selected = true;
-  return { chunks: selected.map((c) => toChunk(c.e)), trace, glossaryNote: hybrid.glossaryNote };
+  return { chunks: selected.map((c) => toChunk(c.e)), trace, glossaryNote };
 }
 
 /** Relevant chunks for a question, best first. Returns [] when nothing is relevant. */

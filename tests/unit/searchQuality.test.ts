@@ -121,6 +121,66 @@ describe("glossary", () => {
   });
 });
 
+describe("several glossary entries", () => {
+  it("parses several definitions in one command, including the 'X = Y | Z = W' form", async () => {
+    const { parseGlossaryDefinitions } = await import("../../src/search/glossary.js");
+    expect(parseGlossaryDefinitions("AHRW = Ad Hoc Revolution Web | G1 = Gestionale 1")).toEqual([
+      ["AHRW", "Ad Hoc Revolution Web"],
+      ["G1", "Gestionale 1"],
+    ]);
+    expect(parseGlossaryDefinitions("A = Alfa | Alpha; B = Beta")).toEqual([
+      ["A", "Alfa", "Alpha"],
+      ["B", "Beta"],
+    ]);
+  });
+
+  it("repairs an entry saved as one before multi-definition parsing", async () => {
+    const { db } = await import("../../src/db/index.js");
+    db.prepare("INSERT INTO bot_settings (key, value) VALUES ('search_glossary', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(
+      JSON.stringify([["XY", "Ics Ipsilon", "ZW = Zeta Doppio"]]),
+    );
+    expect(listGlossary().filter((e) => e.source === "chat").map((e) => e.aliases)).toEqual([
+      ["XY", "Ics Ipsilon"],
+      ["ZW", "Zeta Doppio"],
+    ]);
+    db.prepare("DELETE FROM bot_settings WHERE key = 'search_glossary'").run();
+  });
+
+  it("searches each product separately when a question names several", async () => {
+    await indexDocument(
+      client,
+      "doc-g1",
+      "Vendite",
+      "## Documenti di vendita\nIn Gestionale 1 i documenti di vendita si emettono dal menu Vendite.",
+      1,
+      "/doc/g1",
+      "col",
+    );
+    addGlossaryEntry(["G1", "Gestionale 1"]);
+    try {
+      const { chunks, trace } = await searchWithTrace("come funziona la gestione documenti su Gestionale 1 e su AHRW?", 8, undefined, {
+        rerank: false,
+      });
+      expect(trace.passes.map((p) => p.label)).toEqual(["AHRW", "G1"]);
+      // Each sub-search leaves the other product out.
+      expect(trace.passes[0]!.query).not.toMatch(/gestionale 1/i);
+      expect(trace.passes[1]!.query).not.toMatch(/ahrw/i);
+      const docs = chunks.map((c) => c.docId);
+      expect(docs).toContain("doc-general");
+      expect(docs).toContain("doc-g1");
+      expect(trace.candidates.find((c) => c.docTitle === "Vendite")?.via).toBe("G1");
+
+      const { renderTrace } = await import("../../src/core/searchCommands.js");
+      const text = renderTrace(trace, "tutta la wiki");
+      expect(text).toContain("2 ricerche separate");
+      expect(text).toContain("**Ricerca per G1**");
+      expect(text).toMatch(/\| Vendite › Documenti di vendita \| G1 \|/);
+    } finally {
+      removeGlossaryEntry("G1");
+    }
+  });
+});
+
 describe("relevance filters", () => {
   it("keyword-only: a chunk matching just one generic word is not relevant", async () => {
     embeddingDown = true;

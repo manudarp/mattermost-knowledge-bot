@@ -35,16 +35,35 @@ export function parseGlossaryDefinition(def: string): string[] | null {
   if (eq < 0) return null;
   const aliases = [def.slice(0, eq), ...def.slice(eq + 1).split("|")]
     .map((a) => a.trim().replace(/^["'«]|["'»]$/g, "").trim())
-    .filter(Boolean);
+    .filter((a) => a && !a.includes("="));
   const unique = [...new Map(aliases.map((a) => [normalize(a), a])).values()];
   return unique.length >= 2 ? unique : null;
 }
 
+/**
+ * Several definitions at once, separated by ";" or new lines. A "|" segment
+ * containing "=" starts a new definition, so
+ * "AHRW = Ad hoc Revolution Web | G1 = Gestionale 1" yields two entries.
+ */
+export function parseGlossaryDefinitions(text: string): string[][] {
+  const defs: string[] = [];
+  for (const part of text.split(/[;\n]/)) {
+    let current = "";
+    for (const seg of part.split("|")) {
+      if (seg.includes("=") && current.includes("=")) {
+        defs.push(current);
+        current = seg;
+      } else {
+        current = current ? `${current}|${seg}` : seg;
+      }
+    }
+    if (current.trim()) defs.push(current);
+  }
+  return defs.map((d) => parseGlossaryDefinition(d)).filter((a): a is string[] => a !== null);
+}
+
 function envEntries(): GlossaryEntry[] {
-  return config.SEARCH_GLOSSARY.split(/[;\n]/)
-    .map((d) => parseGlossaryDefinition(d))
-    .filter((a): a is string[] => a !== null)
-    .map((aliases) => ({ aliases, source: "env" as const }));
+  return parseGlossaryDefinitions(config.SEARCH_GLOSSARY).map((aliases) => ({ aliases, source: "env" as const }));
 }
 
 function chatEntries(): GlossaryEntry[] {
@@ -52,7 +71,11 @@ function chatEntries(): GlossaryEntry[] {
   if (!raw) return [];
   try {
     const parsed = JSON.parse(raw) as string[][];
-    return parsed.filter((a) => Array.isArray(a) && a.length >= 2).map((aliases) => ({ aliases, source: "chat" as const }));
+    return parsed
+      .filter((a) => Array.isArray(a) && a.length >= 2)
+      // Repair entries saved before multi-definition parsing ("X = Y | Z = W" stored as one).
+      .flatMap((a) => (a.some((x) => x.includes("=")) ? parseGlossaryDefinitions(`${a[0]} = ${a.slice(1).join("|")}`) : [a]))
+      .map((aliases) => ({ aliases, source: "chat" as const }));
   } catch {
     return [];
   }

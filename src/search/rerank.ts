@@ -30,7 +30,8 @@ Per ogni passaggio assegna un punteggio:
 
 Valuta rispetto a ciò che la domanda chiede davvero. Se la domanda è generale, i passaggi su casi particolari,
 integrazioni o configurazioni specifiche valgono al massimo 1, a meno che la domanda li citi.
-Se la domanda riguarda un prodotto specifico, i passaggi su un prodotto diverso valgono 0.
+Se la domanda riguarda uno o più prodotti specifici, i passaggi su prodotti che la domanda non nomina valgono 0;
+se ne nomina più di uno, un passaggio pertinente per uno qualsiasi di essi va valutato normalmente.
 Rispondi SOLO con un oggetto JSON: {"scores":[{"id":<numero passaggio>,"score":<0-3>}, ...]} con tutti i passaggi.`;
 
 const ScoresSchema = z.object({
