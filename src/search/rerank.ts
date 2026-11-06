@@ -19,7 +19,41 @@ export interface RerankPassage {
   content: string;
 }
 
-const PASSAGE_CHARS = 700;
+const PASSAGE_CHARS = 800;
+
+/**
+ * The part of a passage most worth showing the re-ranker: the window of
+ * `size` characters containing the most distinct query terms. Chunks can be
+ * ~1800 characters and the answer (a field in a table, a code name) is often
+ * past the beginning, where a plain prefix would cut it off.
+ */
+export function focusWindow(text: string, terms: string[], size: number): string {
+  if (text.length <= size) return text;
+  const lower = text.toLowerCase();
+  const hits: Array<{ pos: number; term: number }> = [];
+  terms.forEach((t, ti) => {
+    if (!t) return;
+    for (let p = lower.indexOf(t); p >= 0 && hits.length < 500; p = lower.indexOf(t, p + t.length)) hits.push({ pos: p, term: ti });
+  });
+  if (hits.length === 0) return `${text.slice(0, size)}…`;
+
+  let bestStart = 0;
+  let bestScore = -1;
+  for (const h of hits) {
+    const start = Math.max(0, Math.min(h.pos - Math.floor(size / 4), text.length - size));
+    const inside = hits.filter((x) => x.pos >= start && x.pos < start + size);
+    const score = new Set(inside.map((x) => x.term)).size * 100 + inside.length;
+    if (score > bestScore) {
+      bestScore = score;
+      bestStart = start;
+    }
+  }
+  // Start at a word boundary.
+  const ws = bestStart > 0 ? text.lastIndexOf(" ", bestStart) : 0;
+  const start = ws > 0 && bestStart - ws < 40 ? ws + 1 : bestStart;
+  const end = Math.min(text.length, start + size);
+  return `${start > 0 ? "…" : ""}${text.slice(start, end)}${end < text.length ? "…" : ""}`;
+}
 
 const SYSTEM_PROMPT = `Valuti la pertinenza di passaggi di documentazione aziendale rispetto alla domanda di un utente.
 Per ogni passaggio assegna un punteggio:
@@ -45,6 +79,8 @@ export interface RerankInput {
   glossaryNote?: string;
   /** Previous question in the thread, for short follow-ups. */
   followUpOf?: string;
+  /** Query terms (lowercase): long passages are trimmed around them, not cut at the start. */
+  focusTerms?: string[];
 }
 
 /** Minimum score a passage needs, on the scale of the configured re-ranker. */
@@ -85,7 +121,7 @@ async function rerankWithApi(opts: RerankInput): Promise<number[]> {
   const documents = opts.passages.map((p) => {
     const text = `${p.title}${p.heading && p.heading !== p.title ? ` › ${p.heading}` : ""}
 ${p.content}`;
-    return text.length > config.RERANK_MAX_CHARS ? text.slice(0, config.RERANK_MAX_CHARS) : text;
+    return focusWindow(text, opts.focusTerms ?? [], config.RERANK_MAX_CHARS);
   });
   const body =
     config.RERANK_API_FORMAT === "tei"
@@ -146,7 +182,7 @@ async function rerankWithLlm(opts: RerankInput): Promise<number[]> {
   const { query, passages } = opts;
   const list = passages
     .map((p, i) => {
-      const body = p.content.length > PASSAGE_CHARS ? `${p.content.slice(0, PASSAGE_CHARS)}…` : p.content;
+      const body = focusWindow(p.content, opts.focusTerms ?? [], PASSAGE_CHARS);
       return `[${i + 1}] ${p.title}${p.heading && p.heading !== p.title ? ` › ${p.heading}` : ""}\n${body}`;
     })
     .join("\n\n");

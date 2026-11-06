@@ -115,7 +115,11 @@ export function renderTrace(trace: SearchTrace, scopeLabel: string): string {
       `| ${c.selected ? "✅" : i + 1} | ${cell(title)} |${split ? ` ${c.via ?? ""} |` : ""} ${trace.semantic ? fmt(c.score) : "—"} | ${kw} | ${c.passed ? c.verdict : `❌ ${c.verdict}`} | ${ai} |`,
     );
   });
-  out.push("", "✅ = passaggi passati alla risposta. _Parole chiave_: posizione e % dei termini della domanda presenti.");
+  out.push(
+    "",
+    "✅ = passaggi passati alla risposta. _Parole chiave_: posizione e % dei termini della domanda presenti. " +
+      "_Termine raro_: contiene una parola della domanda presente in pochissimi documenti (es. il nome di un campo).",
+  );
   return out.join("\n");
 }
 

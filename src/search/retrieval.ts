@@ -58,6 +58,12 @@ const CANDIDATES = 50;
 /** Keyword hits ranked this high may count as relevant even with a low cosine score. */
 const KEYWORD_RELEVANT_RANK = 10;
 const MAX_QUERY_TERMS = 16;
+/** A query term found in at most this share of chunks counts as rare (never in a tiny index). */
+const RARE_TERM_SHARE = 0.003;
+/** Rare-term passages kept even when the re-ranker rejects them. */
+const MAX_PROTECTED = 2;
+/** When the re-ranker keeps nothing, the best few with a non-zero score still reach the answer. */
+const RERANK_FALLBACK = 3;
 
 function scopeFilter(scope?: SearchScope): { sql: string; params: string[] } {
   if (scope?.collectionIds) {
@@ -99,6 +105,8 @@ interface Concept {
   /** FTS5 expressions, OR-ed together. */
   fts: string[];
   matches: (normalizedText: string) => boolean;
+  /** Lowercase forms to look for in a passage (stems, aliases), used to focus the re-ranker. */
+  terms: string[];
 }
 
 function phraseExpr(alias: string): string | null {
@@ -126,7 +134,7 @@ function buildConcepts(query: string, matched: GlossaryEntry[]): Concept[] {
       const stem = prefix ? lightStem(t) : t;
       const n = normalize(stem);
       const re = new RegExp(`(^|[^\\p{L}\\p{N}])${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}${prefix ? "" : "($|[^\\p{L}\\p{N}])"}`, "u");
-      return { label: t, fts: [prefix ? `"${stem}"*` : `"${t}"`], matches: (text: string) => re.test(text) };
+      return { label: t, fts: [prefix ? `"${stem}"*` : `"${t}"`], matches: (text: string) => re.test(text), terms: [n] };
     });
   const entries: Concept[] = matched.map((e) => {
     const aliases = e.aliases.map(normalize);
@@ -134,6 +142,7 @@ function buildConcepts(query: string, matched: GlossaryEntry[]): Concept[] {
       label: e.aliases[0]!,
       fts: e.aliases.map(phraseExpr).filter((x): x is string => x !== null),
       matches: (text: string) => aliases.some((a) => containsPhrase(text, a)),
+      terms: aliases,
     };
   });
   return [...singles, ...entries];
@@ -147,15 +156,20 @@ export function ftsQuery(query: string, matched: GlossaryEntry[] = []): string |
 
 const countChunksStmt = db.prepare<[], { n: number }>("SELECT COUNT(*) AS n FROM document_chunks");
 
-/** Rarity weight of each concept (IDF). Concepts found nowhere weigh 0: they can't discriminate. */
-function conceptWeights(concepts: Concept[]): number[] {
+/**
+ * Rarity of each concept: IDF weight (concepts found nowhere weigh 0: they
+ * can't discriminate) and whether it is rare enough to be an identifier-like
+ * term ("TIPDOC", "AHRWTX_Docs") whose exact match is itself strong evidence.
+ */
+function conceptStats(concepts: Concept[]): Array<{ weight: number; rare: boolean }> {
   const total = countChunksStmt.get()?.n ?? 0;
+  const rareMax = Math.floor(total * RARE_TERM_SHARE);
   return concepts.map((c) => {
     try {
       const df = (db.prepare("SELECT COUNT(*) AS n FROM chunks_fts WHERE chunks_fts MATCH ?").get(c.fts.join(" OR ")) as { n: number }).n;
-      return df === 0 ? 0 : Math.log(1 + total / df);
+      return df === 0 ? { weight: 0, rare: false } : { weight: Math.log(1 + total / df), rare: df <= rareMax };
     } catch {
-      return 0;
+      return { weight: 0, rare: false };
     }
   });
 }
@@ -334,20 +348,40 @@ const MAX_TRACE = 45;
 
 interface Evaluated {
   e: Ranked;
+  /** Contains a rare query term (exact identifier-like match). */
+  rare: boolean;
   coverage: number;
   ok: boolean;
   verdict: string;
 }
 
 function evaluate(hybrid: HybridResult, semanticFloor: number): Evaluated[] {
-  const weights = conceptWeights(hybrid.concepts);
+  const stats = conceptStats(hybrid.concepts);
+  const weights = stats.map((s) => s.weight);
+  const rareConcepts = hybrid.concepts.filter((_, i) => stats[i]!.rare);
   return hybrid.ranked.map((e) => {
-    const coverage = e.keywordRank !== null ? coverageOf(e.row, hybrid.concepts, weights) : 0;
+    let coverage = 0;
+    let rare = false;
+    if (e.keywordRank !== null) {
+      coverage = coverageOf(e.row, hybrid.concepts, weights);
+      if (rareConcepts.length > 0) {
+        const text = normalize(`${e.row.doc_title} ${e.row.heading} ${e.row.content}`);
+        rare = rareConcepts.some((c) => c.matches(text));
+      }
+    }
     const semanticOk = hybrid.semantic && e.score >= semanticFloor;
     const strongKeyword = e.keywordRank !== null && e.keywordRank <= KEYWORD_RELEVANT_RANK;
     const keywordOk = strongKeyword && coverage >= config.SEARCH_KEYWORD_MIN_COVERAGE;
-    const verdict = semanticOk ? "semantica" : keywordOk ? "parole chiave" : strongKeyword ? "poche parole della domanda" : "poco simile";
-    return { e, coverage, ok: semanticOk || keywordOk, verdict };
+    const verdict = semanticOk
+      ? "semantica"
+      : keywordOk
+        ? "parole chiave"
+        : rare
+          ? "termine raro"
+          : strongKeyword
+            ? "poche parole della domanda"
+            : "poco simile";
+    return { e, rare, coverage, ok: semanticOk || keywordOk || rare, verdict };
   });
 }
 
@@ -392,7 +426,7 @@ export async function searchWithTrace(
     decomposition = "skipped";
   }
 
-  const passes: Array<{ info: TracePass; evaluated: Evaluated[]; semantic: boolean }> = [];
+  const passes: Array<{ info: TracePass; evaluated: Evaluated[]; semantic: boolean; terms: string[] }> = [];
   for (const sq of subQueries) {
     // Sequential: a local embedding server handles one request at a time anyway.
     const hybrid = await rankHybrid(sq.q, scope);
@@ -401,6 +435,7 @@ export async function searchWithTrace(
       info: { label: sq.label, query: sq.q, embeddingQuery: hybrid.embeddingQuery, fts: hybrid.fts, topScore: hybrid.topScore, semanticFloor },
       evaluated: evaluate(hybrid, semanticFloor),
       semantic: hybrid.semantic,
+      terms: hybrid.concepts.flatMap((c) => c.terms),
     });
   }
 
@@ -439,7 +474,7 @@ export async function searchWithTrace(
   const limit = rerank ? Math.max(topK, rerankCandidates) : topK;
   const perDoc = new Map<string, number>();
   const taken = new Set<number>();
-  const candidates: Array<{ e: Ranked; t: TraceCandidate | null }> = [];
+  const candidates: Array<{ e: Ranked; t: TraceCandidate | null; rare: boolean }> = [];
   const queues = passes.map((p) => p.evaluated.filter((ev) => ev.ok));
   const overflow: Array<{ ev: Evaluated; via: string | null }> = [];
   while (queues.some((q) => q.length > 0)) {
@@ -454,7 +489,7 @@ export async function searchWithTrace(
         addTrace(ev, via, "troppe sezioni dello stesso documento", false);
       } else {
         perDoc.set(ev.e.row.doc_id, (perDoc.get(ev.e.row.doc_id) ?? 0) + 1);
-        candidates.push({ e: ev.e, t: addTrace(ev, via, ev.verdict, true) });
+        candidates.push({ e: ev.e, t: addTrace(ev, via, ev.verdict, true), rare: ev.rare });
       }
     });
     if (candidates.length >= limit && overflow.length >= MAX_TRACE) break;
@@ -469,6 +504,7 @@ export async function searchWithTrace(
     }
   }
 
+  const focusTerms = [...new Set(passes.flatMap((p) => p.terms))];
   let selected = candidates.slice(0, topK);
   if (rerank && candidates.length > 0) {
     try {
@@ -477,14 +513,33 @@ export async function searchWithTrace(
         conversationHint: opts.conversationHint,
         glossaryNote,
         followUpOf: opts.followUpOf,
+        focusTerms,
         passages: candidates.map(({ e }) => ({ title: e.row.doc_title, heading: e.row.heading, content: e.row.content })),
       });
       candidates.forEach((c, i) => {
         if (c.t) c.t.rerankScore = scores[i] ?? 0;
       });
-      selected = candidates
+      const scored = candidates
         .map((c, i) => ({ c, s: scores[i] ?? 0, i }))
-        .filter((x) => x.s >= rerankThreshold())
+        .sort((a, b) => b.s - a.s || a.i - b.i);
+      const threshold = rerankThreshold();
+      const kept = scored.filter((x) => x.s >= threshold);
+      // Safety nets, so a re-ranker misjudgement can't hide an answer that exists:
+      // 1. passages containing a rare term of the question (an exact field or
+      //    code name) are kept even when rated low;
+      for (const x of scored.filter((y) => y.c.rare && y.s < threshold).slice(0, MAX_PROTECTED)) {
+        kept.push(x);
+        if (x.c.t) x.c.t.verdict = `${x.c.t.verdict} · tenuto: termine raro`;
+      }
+      // 2. if nothing passed, the few best with a non-zero score still go to the
+      //    answer model, which is told to ignore what doesn't help.
+      if (kept.length === 0) {
+        for (const x of scored.filter((y) => y.s > 0).slice(0, RERANK_FALLBACK)) {
+          kept.push(x);
+          if (x.c.t) x.c.t.verdict = `${x.c.t.verdict} · tenuto: nessuno sopra soglia`;
+        }
+      }
+      selected = kept
         .sort((a, b) => b.s - a.s || a.i - b.i)
         .slice(0, topK)
         .map((x) => x.c);
